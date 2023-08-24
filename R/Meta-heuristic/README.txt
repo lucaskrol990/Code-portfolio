@@ -8,4 +8,6 @@ The meta-heuristic has been benchmarked on 300 different instances, provided by 
 
 A detailed description of the problem and the meta-heuristic can be found in Description_problem_and_heuristic.pdf
 
-The main code file is Algorithm.R
+The main code file is Algorithm.R. Its dependencies can be found in the Scripts folder.
+
+The instances which need to be solved are found in the Instances folder
