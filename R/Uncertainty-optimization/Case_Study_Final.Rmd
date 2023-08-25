@@ -1,0 +1,2086 @@
+---
+title: "Case_study_final"
+author: "Hidde Poortier"
+date: '2022-10-19'
+output: html_document
+---
+
+```{R setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# (Function) library
+```{R Functions and packages}
+library('lpSolve')
+library("ggplot2")
+library("gurobi")
+library('DiceDesign')
+library(parallel)
+library(foreach)
+library(doParallel)
+numCores <- detectCores()
+numCores
+
+# This function creates unit vectors of length k with j equal to 1
+e <- function(j, k) {
+  return_vec <- rep(0, k)
+  return_vec[j] <- 1
+  if (j <= k) {
+    return(return_vec)
+  } else {
+    return(NA)
+  }
+}
+
+# This function creates vectors with only ones of size n
+iota <- function(n) {
+  return(rep(1, n))
+}
+
+# This function creates zero-matrices of size m x n
+zeros <- function(m, n){
+	Z <- matrix(rep(0, n * m), nrow = m)
+	return(Z)
+}
+```
+
+
+## Basic model:
+
+# Expected value solution:
+Instead of using the random variable xi, we use the expected value of it here. 
+```{R EV A}
+# The parameters as given in the report
+S <- 1
+xi <- c(5, 3, 2)
+c <- c(10, 7, 16, 6)
+q <- c(4, 4.5, 3.2, 5.5)
+dur_mode <- c(10, 6, 1) 
+#xi_max <- sum(xi)
+xi_max <- 14 # We adjust this upwards such that we can calculate the expected result later on
+c_max <- 120
+n <- 4
+k <- 3
+
+# Defining the matrices in accordance to the report
+Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+A    <- rbind(-rep(1, n), c)
+W <- matrix(0, nrow = n + k, ncol = n * k)
+# Filling the first n rows
+for (i in 1:n) {
+  begin <- (i - 1) * k + 1
+  end <- i * k
+  W[i, begin:end] <- iota(k)
+}
+# Filling the last k rows
+for (j in 1:k) {
+  W[(j + n),] <- rep(-e(j, k), n)
+}
+b    <- c(-xi_max, c_max) 
+h    <- c(rep(0, n), -xi)
+
+
+# Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+m1 <- dim(A)[1]
+m2 <- dim(W)[1]
+n1 <- dim(A)[2]
+n2 <- dim(W)[2]
+
+Z  <- zeros(m1, n2 * S)
+LSDE.A <- cbind(A, Z)
+LSDE.A <- rbind(LSDE.A, cbind(-Tech, W))
+
+
+EV <- list()
+EV$A <- LSDE.A
+EV$obj <- c(c, kronecker(q, dur_mode))
+EV$modelsense <- "min"
+EV$rhs <- c(b, h)
+EV$sense <- rep("<=",length(EV$rhs))
+
+result_EV <- gurobi(EV, params = list(OutputFlag=0))
+
+print('Solution:')
+print(result_EV$objval)
+print(result_EV$x[1:n])  # Only prints first-stage solutions
+
+check <- c()
+check[1] <- length(EV$obj) == ncol(LSDE.A) # Number of variables
+check[2] <- length(EV$rhs) == nrow(LSDE.A) # Number of constraints
+check[3] <- nrow(LSDE.A) == length(EV$sense)
+if (sum(1 - check) != 0) {
+  print("Error thrown, dimensions are not correct")
+}
+```
+
+# Expected result (expected costs of expected value solution)
+We basically solve the usual two-stage recourse model here, but then with fixed x's, which means we can ignore the first stage constraints and variables. 
+```{R EEV A}
+# This block does calculations with the random parameter, xi
+S <- 3^3
+p <- c(0.3, 0.4, 0.3)
+xi1 <- c(3, 5, 7)
+xi2 <- c(2, 3, 4)
+xi3 <- c(1, 2, 3)
+xi_matrix <- matrix(NA, nrow = 27, ncol = 3)
+p_vec <- rep(NA, 27)
+l <- 1
+for (i in 1:3) {
+  for (j in 1:3) {
+    for (k in 1:3) {
+      xi_matrix[l,] <- c(xi1[i], xi2[j], xi3[k])
+      p_vec[l] <- p[i] * p[j] * p[k]
+      l <- l + 1
+    }
+  }
+}
+
+# The parameters as given in the report
+c <- c(10, 7, 16, 6)
+q <- c(4, 4.5, 3.2, 5.5)
+dur_mode <- c(10, 6, 1) 
+xi_max <- 14
+c_max <- 120
+n <- 4
+k <- 3
+
+W <- matrix(0, nrow = n + k, ncol = n * k)
+# Filling the first n rows
+for (i in 1:n) {
+  begin <- (i - 1) * k + 1
+  end <- i * k
+  W[i, begin:end] <- iota(k)
+}
+# Filling the last k rows
+for (j in 1:k) {
+  W[(j + n),] <- rep(-e(j, k), n)
+}
+b    <- c(-xi_max, c_max) 
+h    <- c(rep(0, n), rep(-1, k))
+
+# Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+m1 <- 0
+m2 <- dim(W)[1]
+n1 <- 0
+n2 <- dim(W)[2]
+
+S <- 3^3
+LSDE.A <- kronecker(diag(rep(1,S)),W)
+
+EEV <- list() # Recourse model
+EEV$A  <- LSDE.A
+
+# For loop to construct the objective function
+obj_vec <- c() # These are the parameters corresponding to the x's
+for (i in 1:S) {
+  # We have n * k y variables per scenario
+  lower <- (i - 1) * n * k + 1
+  upper <- i * n * k 
+  obj_vec[lower:upper] <- p_vec[i] * kronecker(q, dur_mode)
+}
+EEV$obj <- obj_vec
+EEV$modelsense <- "min"
+# Recall that the dependence on xi is in our h vector
+rhs_vec <- c() # No rhs for Ax = b here, because we only look at the second stage with fixed first stage variables
+for (i in 1:S) { # For each scenario
+  lower <- (i - 1) * (n + k)+ 1
+  upper <- i * (n + k) 
+  rhs_vec[lower:upper] <- c(result_EV$x[1:n], -xi_matrix[i,])# We use the ith realization of the xis as the constraint
+}
+
+EEV$rhs <- rhs_vec
+EEV$sense <- rep("<=",(n+k)*S)
+
+
+result_EEV <- gurobi(EEV, params = list(OutputFlag=0))
+if (result_EEV$status == "INFEASIBLE") {
+  cat("No feasible solution\n")
+}
+print('Solution:')
+print(result_EEV$objval + # Second stage costs
+        sum(result_EV$x[1:n] * c)) # First stage costs
+
+check <- c()
+check[1] <- length(EEV$obj) == ncol(LSDE.A) # Number of variables
+check[2] <- length(EEV$rhs) == nrow(LSDE.A) # Number of constraints
+check[3] <- nrow(LSDE.A) == length(EEV$sense)
+if (sum(1 - check) != 0) {
+  cat("Error thrown, dimensions are not correct")
+}
+
+y <- result_EEV$x[1:length(result_EEV$x)] # All second stage solutions
+
+sequencje <- seq(1, length(y), by = 3) # Takes y_11, y_21, ....
+# Checking if the second stage constraint sum(i=1)^n y_{ij} \geq xi_j actually holds
+for (i in 1:(length(sequencje)/4)) {
+  start <- (i- 1) * 4 + 1
+  end <- i * 4
+  if ((round(sum(y[sequencje[start:end]])) < xi_matrix[i, 1]) ||
+      (round(sum(y[sequencje[(start):(end)]+1])) < xi_matrix[i, 2]) ||
+      (round(sum(y[sequencje[(start):(end)]+2])) < xi_matrix[i, 3])) {
+    print("y_{ij} is not geq than dzeta_j for some j")
+  }
+}
+```
+
+# Solving the recourse model
+```{R Recourse A}
+# This block does calculations with the random parameter, xi
+S <- 3^3
+p <- c(0.3, 0.4, 0.3)
+xi1 <- c(3, 5, 7)
+xi2 <- c(2, 3, 4)
+xi3 <- c(1, 2, 3)
+xi_matrix <- matrix(NA, nrow = 27, ncol = 3) # Contains all different combinations that the xis can take
+p_vec <- rep(NA, 27)
+l <- 1
+for (i in 1:3) {
+  for (j in 1:3) {
+    for (k in 1:3) {
+      xi_matrix[l,] <- c(xi1[i], xi2[j], xi3[k])
+      p_vec[l] <- p[i] * p[j] * p[k]
+      l <- l + 1
+    }
+  }
+}
+
+# The parameters as given in the report
+c <- c(10, 7, 16, 6)
+q <- c(4, 4.5, 3.2, 5.5)
+dur_mode <- c(10, 6, 1) 
+xi_max <- 14
+c_max <- 120
+n <- 4
+k <- 3
+
+# Defining the matrices in accordance to the report
+Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+A    <- rbind(-rep(1, n), c)
+W <- matrix(0, nrow = n + k, ncol = n * k)
+# Filling the first n rows
+for (i in 1:n) {
+  begin <- (i - 1) * k + 1
+  end <- i * k
+  W[i, begin:end] <- iota(k)
+}
+# Filling the last k rows
+for (j in 1:k) {
+  W[(j + n),] <- rep(-e(j, k), n)
+}
+b    <- c(-xi_max, c_max) 
+h    <- c(rep(0, n), rep(-1, k))
+
+# Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+m1 <- dim(A)[1]
+m2 <- dim(W)[1]
+n1 <- dim(A)[2]
+n2 <- dim(W)[2]
+
+Z  <- zeros(m1, n2 * S)
+LSDE.A <- cbind(A,Z)
+LSDE.A <- rbind(LSDE.A, cbind(kronecker(rep(1, S),-Tech), kronecker(diag(rep(1, S)), W)))
+
+# Initializing the variables/matrices for the linear model
+RM <- list() # Recourse model
+RM$A  <- LSDE.A
+
+# For loop to construct the objective function
+obj_vec <- c(c) # These are the parameters corresponding to the x's
+for (i in 1:S) {
+  # We have n * k y variables per scenario
+  lower <- (i - 1) * n * k + length(c) + 1
+  upper <- i * n * k + length(c)
+  obj_vec[lower:upper] <- p_vec[i] * kronecker(q, dur_mode)
+}
+RM$obj <- obj_vec
+RM$modelsense <- "min"
+# Recall that the dependence on xi is in our h vector
+rhs_vec <- c(b) # The rhs for Ax = b, realize that this constraint does not need to be repeated for each scenario
+for (i in 1:S) { # For each scenario
+  lower <- (i - 1) * (n + k)  + length(b) + 1
+  upper <- i * (n + k) + length(b)
+  rhs_vec[lower:upper] <- c(rep(0, n), -xi_matrix[i,])# We use the ith realization of the xis as the constraint
+}
+
+RM$rhs <- rhs_vec
+RM$sense <- rep("<=",(n+k)*S+length(b))
+
+
+result_recourse <- gurobi(RM, params = list(OutputFlag=0))
+if (result_recourse$status == "INFEASIBLE") {
+  cat("No feasible solution\n")
+}
+print('Solution:')
+print(result_recourse$objval)
+print(result_recourse$x[1:n])  # Only prints first-stage solutions
+
+check <- c()
+check[1] <- length(RM$obj) == ncol(LSDE.A) # Number of variables
+check[2] <- length(RM$rhs) == nrow(LSDE.A) # Number of constraints
+check[3] <- nrow(LSDE.A) == length(RM$sense)
+if (sum(1 - check) != 0) {
+  cat("Error thrown, dimensions are not correct")
+}
+
+y <- result_recourse$x[(n+1):length(result_recourse$x)] # All second stage solutions
+
+sequencje <- seq(1, length(y), by = 3) # Takes y_11, y_21, ....
+# Just checking if one of the second stage constraints holds
+for (i in 1:(length(sequencje)/4)) {
+  start <- (i- 1) * 4 + 1
+  end <- i * 4
+  if ((round(sum(y[sequencje[start:end]])) < xi_matrix[i, 1]) ||
+      (round(sum(y[sequencje[(start):(end)]+1])) < xi_matrix[i, 2]) ||
+      (round(sum(y[sequencje[(start):(end)]+2])) < xi_matrix[i, 3])) {
+    print("y_{ij} is not geq than dzeta_j for some j")
+  }
+}
+```
+
+
+# Computing the wait-and-see solution
+In here, we assume that you can choose the x-values at the moment we observe which realization of xi is actually true. So, basically we solve 27 linear programs, one for each different realization of xi, and then use their objective value and weigh it with the probability of that xi value to happen. In each of those linear programs, we now have n * k y-values instead of the S * (n * k) y-values we had in the recourse model, which is the reason why this program runs a lot quicker. 
+```{R Wait and see A}
+# This block does calculations with the random parameter, xi
+S <- 3^3
+p <- c(0.3, 0.4, 0.3)
+xi1 <- c(3, 5, 7)
+xi2 <- c(2, 3, 4)
+xi3 <- c(1, 2, 3)
+xi_matrix <- matrix(NA, nrow = 27, ncol = 3) # Contains all different combinations that the xis can take
+p_vec <- rep(NA, 27)
+l <- 1
+for (i in 1:3) {
+  for (j in 1:3) {
+    for (k in 1:3) {
+      xi_matrix[l,] <- c(xi1[i], xi2[j], xi3[k])
+      p_vec[l] <- p[i] * p[j] * p[k]
+      l <- l + 1
+    }
+  }
+}
+
+# The parameters as given in the report
+c <- c(10, 7, 16, 6)
+q <- c(4, 4.5, 3.2, 5.5)
+dur_mode <- c(10, 6, 1) 
+xi_max <- 14
+c_max <- 120
+n <- 4
+k <- 3
+
+# Defining the matrices in accordance to the report
+Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+A <- rbind(-rep(1, n), c)
+W <- matrix(0, nrow = n + k, ncol = n * k)
+# Filling the first n rows
+for (i in 1:n) {
+  begin <- (i - 1) * k + 1
+  end <- i * k
+  W[i, begin:end] <- iota(k)
+}
+# Filling the last k rows
+for (j in 1:k) {
+  W[(j + n),] <- rep(-e(j, k), n)
+}
+b    <- c(-xi_max, c_max) 
+h    <- c(rep(0, n), rep(-1, k))
+
+# Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+m1 <- dim(A)[1]
+m2 <- dim(W)[1]
+n1 <- dim(A)[2]
+n2 <- dim(W)[2]
+
+Z  <- zeros(m1,n*k)
+LSDE.A <- rbind(cbind(A,Z), cbind(-Tech, W))
+
+# Initializing the variables/matrices for the linear model. We now run a for loop
+# with a total of S simulations. In every iteration we calculate the optimal 
+# solution and save these in matrices. In the end we will calculate the average
+# costs, which should be lower than in the recourse model but higher than in 
+# the EV model (due to our fixed T matrix)
+
+
+x_matrix <- matrix(NA, nrow = S, ncol = n) # Stores the first stage solutions
+y_matrix <- matrix(NA, nrow = S, ncol = n * k) # Stores the second stage solutions
+obj_value <- rep(NA, S) # Stores the objective value
+
+for (s in 1:S) {
+  WS <- list() # Recourse model
+  WS$A  <- LSDE.A
+  
+  # For loop to construct the objective function
+  WS$obj <- c(c, kronecker(q, dur_mode))
+  WS$modelsense <- "min"
+  # Recall that the dependence on xi is in our h vector
+  WS$rhs <- c(b, rep(0, n), -xi_matrix[s, ]) 
+  WS$sense <- rep("<=",(n+k)+length(b))
+  
+  
+  result_WS <- gurobi(WS, params = list(OutputFlag=0))
+  if (result_WS$status == 2) {
+    cat("No feasible solution\n")
+  }
+  obj_value[s] <- result_WS$objval
+  x_matrix[s, ] <- result_WS$x[1:n]  # Only prints first-stage solutions
+  y_matrix[s, ] <- result_WS$x[5:16]
+  
+}
+check <- c()
+check[1] <- length(WS$obj) == ncol(LSDE.A) # Number of variables
+check[2] <- length(WS$rhs) == nrow(LSDE.A) # Number of constraints
+check[3] <- nrow(LSDE.A) == length(WS$sense)
+if (sum(1 - check) != 0) {
+  cat("Error thrown, dimensions are not correct")
+}
+
+cat(paste("The mean costs with the Wait-and-See method are:", mean(obj_value)))
+
+x_matrix
+```
+
+```{R EV B}
+##Expected value solution####
+S <- 1
+xi <- c(5, 3, 2)
+alpha <- c(mean(c(0.6, 0.9)), mean(c(0.7, 0.8)),
+           mean(c(0.5, 0.8)), mean(c(0.9, 1))) 
+c <- c(10, 7, 16, 6, 0)                   
+q <- c(4, 4.5, 3.2, 5.5, 10)             
+dur_mode <- c(10, 6, 1) 
+xi_max <- 14 
+c_max <- 120
+alpha_min <- c(0.6, 0.7, 0.5, 0.9, 1)
+n <- 5       #Number of technologies increased by 1
+k <- 3
+Tech <- rbind(diag(c(alpha, 1)), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) 
+A    <- rbind(-c(0.6, 0.7, 0.5, 0.9, 1), c)
+W <- matrix(0, nrow = n + k, ncol = n * k)
+for (i in 1:n) {
+  begin <- (i - 1) * k + 1
+  end <- i * k
+  W[i, begin:end] <- iota(k)
+}
+for (j in 1:k) {
+  W[(j + n),] <- rep(-e(j, k), n)
+}
+b    <- c(-xi_max, c_max) 
+h    <- c(rep(0, n), -xi)
+
+m1 <- dim(A)[1]
+m2 <- dim(W)[1]
+n1 <- dim(A)[2]
+n2 <- dim(W)[2]
+
+Z  <- zeros(m1,n2*S)
+LSDE.A <- cbind(A,Z)
+LSDE.A <- rbind(LSDE.A, cbind(-Tech, W))
+
+EV <- list()
+EV$A <- LSDE.A
+EV$obj <- c(c, kronecker(q, dur_mode))
+EV$modelsense <- "min"
+EV$rhs <- c(b, h)
+EV$sense <- rep("<=", n + k +2)
+
+result_EV <- gurobi(EV, params = list(OutputFlag=0))
+
+print('Solution:')
+print(result_EV$objval)
+print(result_EV$x[1:n])  # Only prints first-stage solutions
+
+check <- c()
+check[1] <- length(EV$obj) == ncol(LSDE.A) # Number of variables
+check[2] <- length(EV$rhs) == nrow(LSDE.A) # Number of constraints
+check[3] <- nrow(LSDE.A) == length(EV$sense)
+if (sum(1 - check) != 0) {
+  print("Error thrown, dimensions are not correct")
+}
+```
+
+```{R EEV B}
+##Expected result####
+# This block does calculations with the random parameter, xi
+EEV_b <- function(x, rvs) {
+  S <- nrow(rvs)
+  if (S >= 1000) {
+    registerDoParallel(numCores - 1)
+  }
+  n <- 5
+  k <- 3
+  c <- c(10, 7, 16, 6, 0)
+  q <- c(4, 4.5, 3.2, 5.5, 10)
+  dur_mode <- c(10, 6, 1) 
+  c_max <- 120
+  
+  xi_max <- 14
+  
+  
+  
+  # Defining the matrices in accordance to the report
+  Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+  A    <- rbind(-c(0.6, 0.7, 0.5, 0.9, 1), c)
+  W <- matrix(0, nrow = n + k, ncol = n * k)
+  # Filling the first n rows
+  for (i in 1:n) {
+    begin <- (i - 1) * k + 1
+    end <- i * k
+    W[i, begin:end] <- iota(k)
+  }
+  # Filling the last k rows
+  for (j in 1:k) {
+    W[(j + n),] <- rep(-e(j, k), n)
+  }
+  b    <- c(-xi_max, c_max) 
+  h    <- c(rep(0, n), rep(-1, k))
+  
+  # Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+  m1 <- dim(A)[1]
+  m2 <- dim(W)[1]
+  n1 <- dim(A)[2]
+  n2 <- dim(W)[2]
+  
+  Sub <- list()
+  Sub$A          <- W
+  Sub$obj        <- kronecker(q, dur_mode)
+  Sub$modelsense <- "min"
+  Sub$rhs        <- c(rep(0, n), -rvs[1, 1:3]) + (Tech %*% (x * rvs[1, 4:8]))
+  Sub$sense      <- rep('<=', m2)
+  Obj.result = vector(mode = "double", length = S)
+  if (S < 1000) {
+    for (i in 1:S) {
+      Sub$rhs   <- c(rep(0, n), -rvs[i, 1:3]) + (Tech %*% (x * rvs[i, 4:8]))
+      Sub.result <- gurobi(Sub, params = list(OutputFlag = 0))
+      Obj.result[i] <- Sub.result$objval + c %*% x
+    }
+  } else {
+    Obj.result <- foreach (i=1:S, .packages = c("gurobi"), .combine = 'c') %dopar% {
+      Sub$rhs   <- c(rep(0, n), -rvs[i, 1:3]) + (Tech %*% (x * rvs[i, 4:8]))
+      Sub.result <- gurobi(Sub, params = list(OutputFlag = 0))
+      Sub.result$objval + c %*% x
+    }
+    stopImplicitCluster()
+  }
+  
+
+  return(mean(Obj.result))
+}
+
+B <- 99
+S <- 10000
+
+# We use latin hypercube sampling for sampling the alphas
+p <- c(0.3, 0.4, 0.3)
+xi1 <- c(3, 5, 7)
+xi2 <- c(2, 3, 4)
+xi3 <- c(1, 2, 3)
+alpha_min <- c(0.6, 0.7, 0.5, 0.9)
+alpha_max <- c(0.9, 0.8, 0.8, 1)
+
+obj_vec <- c()
+for (b in 1:B) {
+  alpha <- t(t(lhsDesign(S,4,randomized=TRUE)$design%*%diag(alpha_max - alpha_min)) + alpha_min)
+  alpha <- cbind(alpha, rep(1, S))
+  colnames(alpha) = c("alpha1", "alpha2", "alpha3", "alpha4", "alpha5")
+  rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                  "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                  "xi3" = sample(xi3, size = S, replace = TRUE, prob = p)),
+                nrow = S)
+  rvs <- cbind(rvs, alpha)
+  obj_vec[b] <- EEV_b(x = c(6.666667, 4.000000, 0.000000, 0.000000, 7.200000), rvs)
+}
+
+quants <- quantile(sort(obj_vec), c(0.025, 0.975))
+print(paste0("The 95% CI for the objective value is [", round(quants[1], 2), ",", round(quants[2], 2), "]"))
+# Solution: 419.9015
+```
+
+```{R L-Shaped B}
+L_shaped_B <- function(N, S) {
+  registerDoParallel(numCores - 1)
+  solution_matrix <- matrix(nrow = N, ncol = 6)
+  for (r in 1:N) {
+    print(r)
+    ptc <- proc.time()
+    n <- 5
+    k <- 3
+    c <- c(10, 7, 16, 6, 0)
+    q <- c(4, 4.5, 3.2, 5.5, 10)
+    dur_mode <- c(10, 6, 1) 
+    c_max <- 120
+    p <- c(0.3, 0.4, 0.3)
+    xi1 <- c(3, 5, 7)
+    xi2 <- c(2, 3, 4)
+    xi3 <- c(1, 2, 3)
+    xi_max <- 14
+    
+    # We use latin hypercube sampling for sampling the alphas
+    alpha_min <- c(0.6, 0.7, 0.5, 0.9)
+    alpha_max <- c(0.9, 0.8, 0.8, 1)
+    alpha <- t(t(lhsDesign(S,4,randomized=TRUE)$design%*%diag(alpha_max - alpha_min)) + alpha_min)
+    alpha <- cbind(alpha, rep(1, S))
+    rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                    "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                    "xi3" = sample(xi3, size = S, replace = TRUE, prob = p)),
+                  nrow = S)
+    rvs <- cbind(rvs, alpha)
+    
+    
+    # Defining the matrices in accordance to the report
+    Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+    A    <- rbind(-c(0.6, 0.7, 0.5, 0.9, 1), c)
+    W <- matrix(0, nrow = n + k, ncol = n * k)
+    # Filling the first n rows
+    for (i in 1:n) {
+      begin <- (i - 1) * k + 1
+      end <- i * k
+      W[i, begin:end] <- iota(k)
+    }
+    # Filling the last k rows
+    for (j in 1:k) {
+      W[(j + n),] <- rep(-e(j, k), n)
+    }
+    b    <- c(-xi_max, c_max) 
+    h    <- c(rep(0, n), rep(-1, k))
+    
+    # Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+    m1 <- dim(A)[1]
+    m2 <- dim(W)[1]
+    n1 <- dim(A)[2]
+    n2 <- dim(W)[2]
+    
+    
+    Master <- list()
+    
+    Master$A <- cbind(A, zeros(m1, 2))
+    Master$A <- rbind(Master$A, c(rep(0, n1 + 1), 1))
+    Master$obj        <- c(c, 1, -1)
+    Master$modelsense <- "min"
+    Master$rhs        <- c(b, 10**10) 
+    Master$sense      <- c('<=','<=', '<=')
+    
+    Master.result <- gurobi(Master, params = list(OutputFlag = 0))
+    current.x <- Master.result$x[1:n1]
+    # print('Solution:')
+    # print(Master.result$objval)
+    # print(Master.result$x)
+    # Not surprising the first time we solve the master problem x = 0
+    
+    Sub <- list()
+    Sub$A          <- W
+    Sub$obj        <- kronecker(q, dur_mode)
+    Sub$modelsense <- "min"
+    Sub$rhs        <- c(rep(0, n), -rvs[1, 1:3]) + (Tech %*% (current.x * rvs[1, 4:8]))
+    Sub$sense      <- rep('<=', m2)
+    
+    # In the following repeat loop, we iteratively solve the subproblems, add optimality cuts
+    # and solve the master problem until the optimality criterion is met.
+    # We keep track of the number of iterations. I've set the max equal to 1000. You can change that 
+    # of course.
+    it = 0
+    repeat{
+      
+      current.x <- Master.result$x[1:n1]
+      # At each iteration we need to determine Q(x) and a subgradient u of Q at x,
+      # where x is the current first-stage solution.
+      # The objective value of the subproblem equals v(h-T[i]x)
+      # -> Q(x) = sum p[i]v(h-T[i]x)
+      # The dual solution lambda[i,x] is a subgradient of v
+      # Then, u := -sum p[i]*lambda[i,x]*T[i] is the subgradient of Q at x:
+      # -> Q(x) >= Q(x.current) + u*(x-x.current)      <=>
+      # Optimality cut: theta^+-theta^- - u*x >= Q(x.current) - u*x.current
+      
+      Q <- 0
+      u <- 0
+      
+      # We have to calculate T[i]x several times, which is equal to xi[i]*Tech %*% x
+      # Hence, calculate Tx = Tech %*% x here
+      
+      # Observe that u can for this example also be calculated using
+      # u := (-sum p[i]*lambda[i,x]*xi[i])*Tech
+      Qu_list <- foreach (i=1:S, .packages = c("gurobi")) %dopar% {
+        Sub$rhs   <- c(rep(0, n), -rvs[i, 1:3]) + (Tech %*% (current.x * rvs[i, 4:8]))
+        Sub.result <- gurobi(Sub, params = list(OutputFlag = 0))
+        list(Sub$rhs, Sub.result$pi)
+      }
+    
+      for (i in 1:S) {
+        Q <- Q + (1/S) * (Qu_list[[i]][[2]] %*% Qu_list[[i]][[1]])
+        u <- u - (1/S) * Qu_list[[i]][[2]] %*% (-Tech * c(rvs[i, 4:8], 1, 1, 1))
+      }
+      
+    
+      # Stopping criterion. Here I have selected "epsilon" = 10**-5. 	
+      if(c %*% current.x + Q - Master.result$objval <10**-5){
+        break
+      }
+      
+      # Add optimality cut and resolve the master problem
+      Master$A     <- rbind(Master$A, c(-u, 1, -1))
+      Master$rhs   <- c(Master$rhs, Q - u %*% current.x)
+      Master$sense <- c(Master$sense,'>=') 
+      Master.result <- gurobi(Master, params = list(OutputFlag = 0))
+      
+      print('Iteration:')
+      print(it)
+      # print('Objective value current solution')
+      # print(c %*% current.x + Q)
+      # print('Solution:')
+      # print(Master.result$objval)
+      # print(Master.result$x)
+      flush.console()
+      
+      it <- it + 1
+      time_spent <- proc.time() - ptc
+      if ((it > 50) | (time_spent[3] > 60 * 5)) { # max 50 iterations or 5 mins per simulation
+        break
+      }
+    }	
+    
+    # print the solution 
+    print('Solution:')
+    print(Master.result$objval)
+    print(Master.result$x[1:5]) 
+    solution_matrix[r, ] <- c(Master.result$objval, Master.result$x[1:5])
+    proc.time() - ptc
+  }
+  stopImplicitCluster()
+  return(solution_matrix)
+}
+
+tot_ptc <- proc.time()
+solution_matrix_b <- L_shaped_B(1, 100000)
+proc.time() - tot_ptc
+colnames(solution_matrix_b) <- c("Objective value", "x1", "x2", "x3", "x4", "x5")
+print(solution_matrix_b)
+best_solution_b <- solution_matrix_b[1, 2:6]
+solution_frame_b <- as.data.frame(solution_matrix_b)
+save(solution_frame_b, file= "Data//L-shapedb 1x100000 (1).Rda")
+```
+
+```{R 95% CI of objective value}
+B <- 99
+S <- 10000
+obj_vec <- c()
+for (k in 1:B) {
+  p <- c(0.3, 0.4, 0.3)
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  xi_max <- 14
+  
+  # We use latin hypercube sampling for sampling the alphas
+  alpha_min <- c(0.6, 0.7, 0.5, 0.9)
+  alpha_max <- c(0.9, 0.8, 0.8, 1)
+  alpha <- t(t(lhsDesign(S,4,randomized=TRUE)$design%*%diag(alpha_max - alpha_min)) + alpha_min)
+  alpha <- cbind(alpha, rep(1, S))
+  rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                  "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                  "xi3" = sample(xi3, size = S, replace = TRUE, prob = p)),
+                nrow = S)
+  rvs <- cbind(rvs, alpha)
+  if (k %% 10 == 0) {
+    print(k)
+  }
+  obj_vec[k] <- EEV_b(best_solution_b, rvs)
+}
+
+quants <- quantile(sort(obj_vec), c(0.025, 0.975))
+print(paste0("The 95% CI for the objective value is [", round(quants[1], 2), ",", round(quants[2], 2), "]"))
+#"The 95% CI for the objective value is [409.34,412.37]"
+```
+
+```{R MRP L-shaped function}
+# First, we specify the function for the L-shaped function that (also) takes a sample as input:
+## Recourse model of model b
+L_shaped_MRP <- function(N, rvs) {
+  S <- nrow(rvs) 
+  if (S >= 100) {
+    registerDoParallel(numCores - 1)
+  }
+  solution_matrix <- matrix(nrow = N, ncol = 6)
+  for (r in 1:N) {
+    ptc <- proc.time()
+    n <- 5
+    k <- 3
+    c <- c(10, 7, 16, 6, 0)
+    q <- c(4, 4.5, 3.2, 5.5, 10)
+    dur_mode <- c(10, 6, 1) 
+    c_max <- 120
+    p <- c(0.3, 0.4, 0.3)
+    xi1 <- c(3, 5, 7)
+    xi2 <- c(2, 3, 4)
+    xi3 <- c(1, 2, 3)
+    xi_max <- 14
+    
+    # Defining the matrices in accordance to the report
+    Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+    A    <- rbind(-c(0.6, 0.7, 0.5, 0.9, 1), c)
+    W <- matrix(0, nrow = n + k, ncol = n * k)
+    # Filling the first n rows
+    for (i in 1:n) {
+      begin <- (i - 1) * k + 1
+      end <- i * k
+      W[i, begin:end] <- iota(k)
+    }
+    # Filling the last k rows
+    for (j in 1:k) {
+      W[(j + n),] <- rep(-e(j, k), n)
+    }
+    b    <- c(-xi_max, c_max) 
+    h    <- c(rep(0, n), rep(-1, k))
+    
+    # Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+    m1 <- dim(A)[1]
+    m2 <- dim(W)[1]
+    n1 <- dim(A)[2]
+    n2 <- dim(W)[2]
+    
+    
+    Master <- list()
+    
+    Master$A <- cbind(A, zeros(m1, 2))
+    Master$A <- rbind(Master$A, c(rep(0, n1 + 1), 1))
+    Master$obj        <- c(c, 1, -1)
+    Master$modelsense <- "min"
+    Master$rhs        <- c(b, 10**10) 
+    Master$sense      <- c('<=','<=', '<=')
+    
+    Master.result <- gurobi(Master, params = list(OutputFlag = 0))
+    current.x <- Master.result$x[1:n1]
+    # print('Solution:')
+    # print(Master.result$objval)
+    # print(Master.result$x)
+    # Not surprising the first time we solve the master problem x = 0
+    
+    Sub <- list()
+    Sub$A          <- W
+    Sub$obj        <- kronecker(q, dur_mode)
+    Sub$modelsense <- "min"
+    Sub$rhs        <- c(rep(0, n), -rvs[1, 1:3]) + (Tech %*% (current.x * rvs[1, 4:8]))
+    Sub$sense      <- rep('<=', m2)
+    
+    # In the following repeat loop, we iteratively solve the subproblems, add optimality cuts
+    # and solve the master problem until the optimality criterion is met.
+    # We keep track of the number of iterations. I've set the max equal to 1000. You can change that 
+    # of course.
+    it = 0
+    repeat{
+      
+      current.x <- Master.result$x[1:n1]
+      # At each iteration we need to determine Q(x) and a subgradient u of Q at x,
+      # where x is the current first-stage solution.
+      # The objective value of the subproblem equals v(h-T[i]x)
+      # -> Q(x) = sum p[i]v(h-T[i]x)
+      # The dual solution lambda[i,x] is a subgradient of v
+      # Then, u := -sum p[i]*lambda[i,x]*T[i] is the subgradient of Q at x:
+      # -> Q(x) >= Q(x.current) + u*(x-x.current)      <=>
+      # Optimality cut: theta^+-theta^- - u*x >= Q(x.current) - u*x.current
+      
+      Q <- 0
+      u <- 0
+      
+      # We have to calculate T[i]x several times, which is equal to xi[i]*Tech %*% x
+      # Hence, calculate Tx = Tech %*% x here
+      
+      # Observe that u can for this example also be calculated using
+      # u := (-sum p[i]*lambda[i,x]*xi[i])*Tech
+      Qu_list <- foreach (i=1:S, .packages = c("gurobi")) %dopar% {
+      #for (i in 1:S) {
+        #library(gurobi)
+        Sub$rhs   <- c(rep(0, n), -rvs[i, 1:3]) + (Tech %*% (current.x * rvs[i, 4:8]))
+        Sub.result <- gurobi(Sub, params = list(OutputFlag = 0))
+        list(Sub$rhs, Sub.result$pi)
+      }
+    
+      for (i in 1:S) {
+        Q <- Q + (1/S) * (Qu_list[[i]][[2]] %*% Qu_list[[i]][[1]])
+        u <- u - (1/S) * Qu_list[[i]][[2]] %*% (-Tech * c(rvs[i, 4:8], 1, 1, 1))
+      }
+      
+      
+      # Stopping criterion. Here I have selected "epsilon" = 10**-5. 	
+      if(c %*% current.x + Q - Master.result$objval <10**-5){
+        break
+      }
+      
+      # Add optimality cut and resolve the master problem
+      Master$A     <- rbind(Master$A, c(-u, 1, -1))
+      Master$rhs   <- c(Master$rhs, Q - u %*% current.x)
+      Master$sense <- c(Master$sense,'>=') 
+      Master.result <- gurobi(Master, params = list(OutputFlag = 0))
+      
+      # print('Iteration:')
+      # print(it)
+      # print('Objective value current solution')
+      # print(c %*% current.x + Q)
+      # print('Solution:')
+      # print(Master.result$objval)
+      # print(Master.result$x)
+      flush.console()
+      
+      it <- it + 1
+      time_spent <- proc.time() - ptc
+      if ((it > 50) | (time_spent[3] > 60 * 5)) { # max 50 iterations or 5 mins per simulation
+        break
+      }
+    }	
+    
+    # print the solution 
+    print('Solution:')
+    print(Master.result$objval)
+    print(Master.result$x[1:5]) 
+    solution_matrix[r, ] <- c(Master.result$objval, Master.result$x[1:5])
+    proc.time() - ptc
+  }
+  if (S >= 100) {
+    stopImplicitCluster()
+  }
+  return(solution_matrix)
+}
+```
+
+```{R MRP L-shaped solution}
+N <- 10
+S <- 1000
+G_K_vec <- c()
+for (i in 1:N) {
+  print(i)
+  # We use latin hypercube sampling for sampling the alphas
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  p <- c(0.3, 0.4, 0.3)
+  alpha_min <- c(0.6, 0.7, 0.5, 0.9)
+  alpha_max <- c(0.9, 0.8, 0.8, 1)
+  alpha <- t(t(lhsDesign(S,4,randomized=TRUE)$design%*%diag(alpha_max - alpha_min)) + alpha_min)
+  alpha <- cbind(alpha, rep(1, S))
+  rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                  "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                  "xi3" = sample(xi3, size = S, replace = TRUE, prob = p)
+                  ),
+                nrow = S, byrow = FALSE)
+  rvs <- cbind(rvs, alpha)
+  sample_x <- L_shaped_MRP(1, rvs)[2:6]
+  print(sample_x)
+  G_vec <- c() # Stores the differences in optimal values
+  for (j in 1:S) {
+    G_vec[j] <- EEV_b(best_solution_b, matrix(rvs[j, ], nrow = 1)) - EEV_b(sample_x, matrix(rvs[j, ], nrow = 1))
+  }
+  G_K_vec[i] <- mean(G_vec)
+}
+
+
+upperbound <- mean(G_K_vec) + qt(0.95, N - 1) * (1 / sqrt(N)) * (1 / (N - 1)) * sum((G_K_vec - mean(G_K_vec))^2)
+print(paste0("The 95% MRP CI is: [0, ", upperbound, "]"))
+as.data.frame(upperbound)
+save(upperbound, file= "MRP_b.Rda")
+"The 95% MRP CI is: [0, 0.0474649357704559]"
+```
+
+
+```{R Wait and See B}
+S <- 10000
+B <- 99
+obj_vec <- c()
+obj_first_vec <- c()
+obj_second_vec <- c()
+for (r in 1:B) {
+  # This block does calculations with the random parameter, xi
+  print(r)
+  p <- c(0.3, 0.4, 0.3)
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  xi_max <- 14
+  
+  rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                  "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                  "xi3" = sample(xi3, size = S, replace = TRUE, prob = p),
+                  "alpha1" = runif(n = S, min = 0.6, max = 0.9),
+                  "alpha2" = runif(n = S, min = 0.7, max = 0.8),
+                  "alpha3" = runif(n = S, min = 0.5, max = 0.8),
+                  "alpha4" = runif(n = S, min = 0.9, max = 1),
+                  "alpha5" = rep(1, S)), ncol = 8, byrow = F) 
+  
+  
+  # The parameters as given in the report
+  c <- c(10, 7, 16, 6, 0)
+  q <- c(4, 4.5, 3.2, 5.5, 10)
+  dur_mode <- c(10, 6, 1) 
+  xi_max <- 14
+  c_max <- 120
+  n <- 5
+  k <- 3
+  
+  # Defining the matrices in accordance to the report
+  Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+  A <- rbind(-rep(1, n), c)
+  W <- matrix(0, nrow = n + k, ncol = n * k)
+  # Filling the first n rows
+  for (i in 1:n) {
+    begin <- (i - 1) * k + 1
+    end <- i * k
+    W[i, begin:end] <- iota(k)
+  }
+  # Filling the last k rows
+  for (j in 1:k) {
+    W[(j + n),] <- rep(-e(j, k), n)
+  }
+  b    <- c(-xi_max, c_max) 
+  h    <- c(rep(0, n), rep(-1, k))
+  
+  # Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+  m1 <- dim(A)[1]
+  m2 <- dim(W)[1]
+  n1 <- dim(A)[2]
+  n2 <- dim(W)[2]
+  
+  Z  <- zeros(m1,n*k)
+  
+  
+  # Initializing the variables/matrices for the linear model. We now run a for loop
+  # with a total of S simulations. In every iteration we calculate the optimal 
+  # solution and save these in matrices. In the end we will calculate the average
+  # costs, which should be lower than in the recourse model but higher than in 
+  # the EV model (due to our fixed T matrix)
+  
+  
+  x_matrix <- matrix(NA, nrow = S, ncol = n) # Stores the first stage solutions
+  y_matrix <- matrix(NA, nrow = S, ncol = n * k) # Stores the second stage solutions
+  obj_value_B <- vector(mode = "double", length = S) # Stores the objective value
+  obj_first_stage <- c()
+  obj_second_stage <- c()
+  for (i in 1:S) {
+    A[1, ] = -rvs[i, 4:8]
+    LSDE.A <- rbind(cbind(A, Z), cbind(-(Tech * c(rvs[i, 4:8], 1, 1, 1)), W))
+    WS_B <- list() # Recourse model
+    WS_B$A  <- LSDE.A
+    WS_B$obj <- c(c, kronecker(q, dur_mode))
+    WS_B$modelsense <- "min"
+    WS_B$rhs <- c(b, rep(0, n), -rvs[i, 1:3]) 
+    WS_B$sense <- rep("<=",(n+k)+length(b))
+    result_WS_B <- gurobi(WS_B, params = list(OutputFlag=0))
+    obj_value_B[i] <- result_WS_B$objval
+    obj_first_stage[i] <- sum(result_WS_B$x[1:5] * c)
+    obj_second_stage[i] <- sum(result_WS_B$x[6:20] * WS_B$obj[6:20])
+  }
+  obj_vec[r] <- mean(obj_value_B)
+  obj_first_vec[r] <- mean(obj_first_stage)
+  obj_second_vec[r] <- mean(obj_second_stage)
+}
+quants <- quantile(sort(obj_vec), c(0.025, 0.975))
+quants_fs <- quantile(sort(obj_first_vec), c(0.025, 0.975))
+quants_ss <- quantile(sort(obj_second_vec), c(0.025, 0.975))
+print(paste0("The 95% CI for the objective value is [", round(quants[1], 2), ",", round(quants[2], 2), "]"))
+print(paste0("The 95% CI for the FS objective value is [", round(quants_fs[1], 2), ",", round(quants_fs[2], 2), "]"))
+print(paste0("The 95% CI for the SS objective value is [", round(quants_ss[1], 2), ",", round(quants_ss[2], 2), "]"))
+
+# "The 95% CI for the objective value is [392.17,395.36]"
+# "The 95% CI for the FS objective value is [90.93,91.72]"
+# "The 95% CI for the SS objective value is [301.11,303.86]"
+```
+
+```{R EV C}
+#SAME AS B
+S <- 1
+xi <- c(5, 3, 2)
+alpha <- c(mean(c(0.6, 0.9)), mean(c(0.7, 0.8)),
+           mean(c(0.5, 0.8)), mean(c(0.9, 1))) #Add alpha vector
+c <- c(10, 7, 16, 6, 0)                  #Add investment cost for foreign energy 
+q <- c(4, 4.5, 3.2, 5.5, 10)             #Add production cost for foreign engergy
+dur_mode <- c(10, 6, 1)
+#xi_max <- sum(xi)
+xi_max <- 14 # We adjust this upwards such that we can calculate the expected result later on
+c_max <- 120
+alpha_min <- c(0.6, 0.7, 0.5, 0.9, 1)
+n <- 5       #Number of technologies increased by 1
+k <- 3
+
+
+# This is the "average/nominal" technology matrix
+Tech <- rbind(diag(c(alpha, 1)), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+A    <- rbind(-c(0.6, 0.7, 0.5, 0.9, 1), c)
+W <- matrix(0, nrow = n + k, ncol = n * k)
+# Filling the first n rows
+for (i in 1:n) {
+  begin <- (i - 1) * k + 1
+  end <- i * k
+  W[i, begin:end] <- iota(k)
+}
+# Filling the last k rows
+for (j in 1:k) {
+  W[(j + n),] <- rep(-e(j, k), n)
+}
+b    <- c(-xi_max, c_max) 
+h    <- c(rep(0, n), -xi)
+
+# Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+m1 <- dim(A)[1]
+m2 <- dim(W)[1]
+n1 <- dim(A)[2]
+n2 <- dim(W)[2]
+
+# Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+
+Z  <- zeros(m1,n2*S)
+LSDE.A <- cbind(A,Z)
+LSDE.A <- rbind(LSDE.A, cbind(-Tech, W))
+
+
+EV <- list()
+EV$A <- LSDE.A
+EV$obj <- c(c, kronecker(q, dur_mode))
+EV$modelsense <- "min"
+EV$rhs <- c(b, h)
+EV$sense <- rep("<=", n + k +2)
+
+result_EV <- gurobi(EV, params = list(OutputFlag=0))
+
+print('Solution:')
+print(result_EV$objval)
+print(result_EV$x[1:n])  # Only prints first-stage solutions
+
+check <- c()
+check[1] <- length(EV$obj) == ncol(LSDE.A) # Number of variables
+check[2] <- length(EV$rhs) == nrow(LSDE.A) # Number of constraints
+check[3] <- nrow(LSDE.A) == length(EV$sense)
+if (sum(1 - check) != 0) {
+  print("Error thrown, dimensions are not correct")
+}
+```
+
+```{R EEV C}
+##Expected result####
+EEV_c <- function(x, rvs) {
+  S <- nrow(rvs)
+  if (S >= 10000) {
+    registerDoParallel(numCores - 1)
+  }
+  # This block does calculations with the random parameter, xi
+  n <- 5
+  k <- 3
+  c <- c(10, 7, 16, 6, 0)
+  q <- c(4, 4.5, 3.2, 5.5, 10)
+  dur_mode <- c(10, 6, 1) 
+  c_max <- 120
+  p <- c(0.3, 0.4, 0.3)
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  xi_max <- 14
+  
+  
+  T2 = c(5, 7.5)
+  T3 = c(0.5, 1.75)
+  PT = c(0.6, 0.4)
+  
+  
+  # Defining the matrices in accordance to the report
+  Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+  A    <- rbind(-c(0.6, 0.7, 0.5, 0.9, 1), c)
+  W <- matrix(0, nrow = n + k, ncol = n * k)
+  # Filling the first n rows
+  for (i in 1:n) {
+    begin <- (i - 1) * k + 1
+    end <- i * k
+    W[i, begin:end] <- iota(k)
+  }
+  # Filling the last k rows
+  for (j in 1:k) {
+    W[(j + n),] <- rep(-e(j, k), n)
+  }
+  b    <- c(-xi_max, c_max) 
+  h    <- c(rep(0, n), rep(-1, k))
+  
+  # Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+  m1 <- dim(A)[1]
+  m2 <- dim(W)[1]
+  n1 <- dim(A)[2]
+  n2 <- dim(W)[2]
+  
+  Sub <- list()
+  Sub$A          <- W
+  Sub$modelsense <- "min"
+  Sub$rhs        <- c(rep(0, n), -rvs[1, 1:3]) + (Tech %*% (x * rvs[1, 4:8]))
+  Sub$sense      <- rep('<=', m2)
+  if (S < 10000) {
+    Obj.result = vector(mode = "double", length = S)
+    for (i in 1:S) {
+      Sub$obj <- kronecker(q, c(10, rvs[i, 9:10]))
+      Sub$rhs <- c(rep(0, n), -rvs[i, 1:3]) + (Tech %*% (x * rvs[i, 4:8]))
+      Sub.result <- gurobi(Sub, params = list(OutputFlag = 0))
+      Obj.result[i] <- Sub.result$objval + c %*% x
+    }
+  } else {
+    Obj.result <- foreach (i=1:S, .packages = c("gurobi"), .combine = "c") %dopar% {
+      Sub$obj <- kronecker(q, c(10, rvs[i, 9:10]))
+      Sub$rhs <- c(rep(0, n), -rvs[i, 1:3]) + (Tech %*% (x * rvs[i, 4:8]))
+      Sub.result <- gurobi(Sub, params = list(OutputFlag = 0))
+      Sub.result$objval + c %*% x
+    }
+  }
+  
+  
+  if (S >= 10000) {
+    stopImplicitCluster()
+  }
+  return(mean(Obj.result))
+}
+
+B <- 99
+S <- 10000
+obj_vec <- c()
+
+p <- c(0.3, 0.4, 0.3)
+xi1 <- c(3, 5, 7)
+xi2 <- c(2, 3, 4)
+xi3 <- c(1, 2, 3)
+xi_max <- 14
+alpha_min <- c(0.6, 0.7, 0.5, 0.9)
+alpha_max <- c(0.9, 0.8, 0.8, 1)
+for (b in 1:B) {
+  print(b)
+  # We use latin hypercube sampling for sampling the alphas
+  alpha <- t(t(lhsDesign(S,4,randomized=TRUE)$design%*%diag(alpha_max - alpha_min)) + alpha_min)
+  alpha <- cbind(alpha, rep(1, S))
+  rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                  "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                  "xi3" = sample(xi3, size = S, replace = TRUE, prob = p)),
+                nrow = S)
+  rvs <- cbind(rvs, alpha)
+  
+  T2 = c(5, 7.5)
+  T3 = c(0.5, 1.75)
+  PT = c(0.6, 0.4)
+  T_matrix <- matrix(c("T2" = sample(T2, size = S , replace = TRUE, prob = PT),
+                  "T3" = sample(T3, size = S , replace = TRUE, prob = PT)), nrow = S)
+  rvs <- cbind(rvs, T_matrix)
+  
+  obj_vec[b] <- EEV_c(x = c(6.666667, 4.000000, 0.000000, 0.000000, 7.200000), rvs)
+}
+
+quants <- quantile(sort(obj_vec), c(0.025, 0.975))
+print(paste0("The 95% CI for the objective value is [", round(quants[1], 2), ",", round(quants[2], 2), "]"))
+```
+
+```{R L-shaped C}
+tot_ptc <- proc.time()
+L_shaped_C <- function(rvs) {
+  solution_matrix <- matrix(nrow = 1, ncol = 6)
+  registerDoParallel(numCores - 1)
+  ptc <- proc.time()
+  S <- nrow(rvs)
+  n <- 5
+  k <- 3
+  c <- c(10, 7, 16, 6, 0)
+  q <- c(4, 4.5, 3.2, 5.5, 10)
+  dur_mode <- c(10, 6, 1) 
+  c_max <- 120
+  p <- c(0.3, 0.4, 0.3)
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  xi_max <- 14
+  
+  T2 = c(5, 7.5)
+  T3 = c(0.5, 1.75)
+  PT = c(0.6, 0.4)
+  
+  # Defining the matrices in accordance to the report
+  Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+  A    <- rbind(-c(0.6, 0.7, 0.5, 0.9, 1), c)
+  W <- matrix(0, nrow = n + k, ncol = n * k)
+  # Filling the first n rows
+  for (i in 1:n) {
+    begin <- (i - 1) * k + 1
+    end <- i * k
+    W[i, begin:end] <- iota(k)
+  }
+  # Filling the last k rows
+  for (j in 1:k) {
+    W[(j + n),] <- rep(-e(j, k), n)
+  }
+  b    <- c(-xi_max, c_max) 
+  h    <- c(rep(0, n), rep(-1, k))
+  
+  # Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+  m1 <- dim(A)[1]
+  m2 <- dim(W)[1]
+  n1 <- dim(A)[2]
+  n2 <- dim(W)[2]
+  
+  
+  Master_C <- list()
+  
+  Master_C$A <- cbind(A, zeros(m1, 2))
+  Master_C$A <- rbind(Master_C$A, c(rep(0, n1 + 1), 1))
+  Master_C$obj        <- c(c, 1, -1)
+  Master_C$modelsense <- "min"
+  Master_C$rhs        <- c(b, 10**10) 
+  Master_C$sense      <- c('<=','<=', '<=')
+  
+  Master_C.result <- gurobi(Master_C, params = list(OutputFlag = 0))
+  current.x <- Master_C.result$x[1:n1]
+  # Not surprising the first time we solve the master problem x = 0
+  
+  Sub_C <- list()
+  Sub_C$A          <- W
+  Sub_C$obj        <- kronecker(q, dur_mode)
+  Sub_C$modelsense <- "min"
+  Sub_C$rhs        <- c(rep(0, n), -rvs[1, 1:3]) + (Tech %*% (current.x * rvs[1, 4:8]))
+  Sub_C$sense      <- rep('<=', m2)
+  
+  # In the following repeat loop, we iteratively solve the subproblems, add optimality cuts
+  # and solve the master problem until the optimality criterion is met.
+  # We keep track of the number of iterations. I've set the max equal to 1000. You can change that 
+  # of course.
+  it = 0
+  repeat{
+    
+    current.x <- Master_C.result$x[1:n1]
+    # At each iteration we need to determine Q(x) and a subgradient u of Q at x,
+    # where x is the current first-stage solution.
+    # The objective value of the subproblem equals v(h-T[i]x)
+    # -> Q(x) = sum p[i]v(h-T[i]x)
+    # The dual solution lambda[i,x] is a subgradient of v
+    # Then, u := -sum p[i]*lambda[i,x]*T[i] is the subgradient of Q at x:
+    # -> Q(x) >= Q(x.current) + u*(x-x.current)      <=>
+    # Optimality cut: theta^+-theta^- - u*x >= Q(x.current) - u*x.current
+    
+    Q <- 0
+    u <- 0
+    
+    # We have to calculate T[i]x several times, which is equal to xi[i]*Tech %*% x
+    # Hence, calculate Tx = Tech %*% x here
+    
+    # Observe that u can for this example also be calculated using
+    # u := (-sum p[i]*lambda[i,x]*xi[i])*Tech
+    
+    Qu_list <- foreach (i=1:S, .packages = c("gurobi")) %dopar% {
+      Sub_C$obj   <- kronecker(q, c(10, rvs[i, 9:10]))
+      Sub_C$rhs   <- c(rep(0, n), -rvs[i, 1:3]) + (Tech %*% (current.x * rvs[i, 4:8]))
+      Sub_C.result <- gurobi(Sub_C, params = list(OutputFlag = 0))
+      list(Sub_C$rhs, Sub_C.result$pi)
+    }
+    
+
+    for (i in 1:S) {
+      Q <- Q + (1/S) * (Qu_list[[i]][[2]] %*% Qu_list[[i]][[1]])
+      u <- u - (1/S) * Qu_list[[i]][[2]] %*% (-Tech * c(rvs[i, 4:8], 1, 1, 1))
+    }
+    
+    # Stopping criterion. Here I have selected "epsilon" = 10**-5. 	
+    if (c %*% current.x + Q - Master_C.result$objval <10**-5){
+      break
+    }
+    
+    # Add optimality cut and resolve the master problem
+    Master_C$A     <- rbind(Master_C$A, c(-u, 1, -1))
+    Master_C$rhs   <- c(Master_C$rhs, Q - u %*% current.x)
+    Master_C$sense <- c(Master_C$sense,'>=') 
+    Master_C.result <- gurobi(Master_C, params = list(OutputFlag = 0))
+    
+    # print('Iteration:')
+    # print(it)
+    
+    it <- it + 1
+    time_spent <- proc.time() - ptc
+    if ((it > 50) | (time_spent[3] > 60 * 5)) { # max 50 iterations or 5 mins per simulation
+      break
+    }
+  }	
+  stopImplicitCluster()
+  # print the solution 
+  print('Solution:')
+  print(Master_C.result$objval)
+  print(Master_C.result$x[1:5])
+  solution_matrix[1, ] <- c(Master_C.result$objval, Master_C.result$x[1:5])
+  proc.time() - ptc
+  return(solution_matrix)
+}
+
+S <- 100000
+p <- c(0.3, 0.4, 0.3)
+xi1 <- c(3, 5, 7)
+xi2 <- c(2, 3, 4)
+xi3 <- c(1, 2, 3)
+xi_max <- 14
+
+# We use latin hypercube sampling for sampling the alphas
+alpha_min <- c(0.6, 0.7, 0.5, 0.9)
+alpha_max <- c(0.9, 0.8, 0.8, 1)
+alpha <- t(t(lhsDesign(S,4,randomized=TRUE)$design%*%diag(alpha_max - alpha_min)) + alpha_min)
+alpha <- cbind(alpha, rep(1, S))
+rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                "xi3" = sample(xi3, size = S, replace = TRUE, prob = p)),
+              nrow = S)
+rvs <- cbind(rvs, alpha)
+T2 = c(5, 7.5)
+T3 = c(0.5, 1.75)
+PT = c(0.6, 0.4)
+T_matrix <- matrix(c("T2" = sample(T2, size = S , replace = TRUE, prob = PT),
+                "T3" = sample(T3, size = S , replace = TRUE, prob = PT)), nrow = S)
+rvs <- cbind(rvs, T_matrix)
+
+solution_matrix_c <- L_shaped_C(rvs)
+colnames(solution_matrix_c) <- c("Objective value", "x1", "x2", "x3", "x4", "x5")
+print(solution_matrix_c)
+
+solution_frame_c <- as.data.frame(solution_matrix_c)
+save(solution_frame_c, file= "Data//L-shapedc 1x100000.Rda")
+best_solution_c <- solution_matrix_c[1, 2:6]
+```
+
+```{R 95% CI of objective value}
+B <- 99
+S <- 10000
+obj_vec <- c()
+for (k in 1:B) {
+  p <- c(0.3, 0.4, 0.3)
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  xi_max <- 14
+  
+  # We use latin hypercube sampling for sampling the alphas
+  alpha_min <- c(0.6, 0.7, 0.5, 0.9)
+  alpha_max <- c(0.9, 0.8, 0.8, 1)
+  alpha <- t(t(lhsDesign(S,4,randomized=TRUE)$design%*%diag(alpha_max - alpha_min)) + alpha_min)
+  alpha <- cbind(alpha, rep(1, S))
+  rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                  "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                  "xi3" = sample(xi3, size = S, replace = TRUE, prob = p)),
+                nrow = S)
+  rvs <- cbind(rvs, alpha)
+  T2 = c(5, 7.5)
+  T3 = c(0.5, 1.75)
+  PT = c(0.6, 0.4)
+  T_matrix <- matrix(c("T2" = sample(T2, size = S , replace = TRUE, prob = PT),
+                  "T3" = sample(T3, size = S , replace = TRUE, prob = PT)), nrow = S)
+  rvs <- cbind(rvs, T_matrix)
+
+  if (k %% 10 == 0) {
+    print(k)
+  }
+  obj_vec[k] <- EEV_c(best_solution_c, rvs)
+}
+
+quants <- quantile(sort(obj_vec), c(0.025, 0.975))
+print(paste0("The 95% CI for the objective value is [", round(quants[1], 2), ",", round(quants[2], 2), "]"))
+#"The 95% CI for the objective value is [409.36,412.74]"
+```
+
+```{R Find best L-shaped solution c}
+# registerDoParallel(numCores - 1)
+# best_matrix <- solution_matrix
+# solution_left <- c(nrow(best_matrix), 0.1 * nrow(best_matrix), 2, 1)
+# iteration_vec <- c(10, 50, 200)
+# S <- 1000
+# for (i in 1:length(iteration_vec)) {
+#   for (j in 1:solution_left[i]) {
+#     if (j %% 10 == 0) {print(j)}
+#     cost_vec <- foreach (k = 1:iteration_vec[i], .combine = 'c', .packages = c("gurobi", "DiceDesign")) %dopar% {
+#       # Calculate the expected result k times for a sample size of S
+#       EEV_c(best_matrix[j, 2:6], S) 
+#     }
+#     # Calculating the average costs
+#     best_matrix[j, 1] <- mean(cost_vec)
+#   }
+#   # Remove the worst results and then increase the number of iterations for the 
+#   # ones that survive
+#   indices_best <- which(best_matrix[, 1] <= sort(best_matrix[, 1])[solution_left[i + 1]])
+#   best_matrix <- best_matrix[indices_best,]
+# }
+# stopImplicitCluster()
+# print(best_matrix)
+# best_solution <- as.data.frame(best_matrix)
+# save(best_solution, file= "Data//best_solution_c.Rda")
+```
+
+```{R MRP L-shaped solution}
+N <- 10
+S <- 1000
+G_K_vec <- c()
+for (i in 1:N) {
+  print(i)
+  # We use latin hypercube sampling for sampling the alphas
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  p <- c(0.3, 0.4, 0.3)
+  alpha_min <- c(0.6, 0.7, 0.5, 0.9)
+  alpha_max <- c(0.9, 0.8, 0.8, 1)
+  alpha <- t(t(lhsDesign(S,4,randomized=TRUE)$design%*%diag(alpha_max - alpha_min)) + alpha_min)
+  alpha <- cbind(alpha, rep(1, S))
+  rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                  "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                  "xi3" = sample(xi3, size = S, replace = TRUE, prob = p)
+                  ),
+                nrow = S, byrow = FALSE)
+  rvs <- cbind(rvs, alpha)
+  T2 = c(5, 7.5)
+  T3 = c(0.5, 1.75)
+  PT = c(0.6, 0.4)
+  T_matrix <- matrix(c("T2" = sample(T2, size = S , replace = TRUE, prob = PT),
+                  "T3" = sample(T3, size = S , replace = TRUE, prob = PT)), nrow = S)
+  rvs <- cbind(rvs, T_matrix)
+
+  sample_x <- L_shaped_C(rvs)[2:6]
+  G_vec <- c() # Stores the differences in optimal values
+  for (j in 1:S) {
+    G_vec[j] <- EEV_c(best_solution_c, matrix(rvs[j, ], nrow = 1)) - EEV_c(sample_x, matrix(rvs[j, ], nrow = 1))
+  }
+  G_K_vec[i] <- mean(G_vec)
+}
+
+print(paste0("The 95% MRP CI is: [0, ", mean(G_K_vec) + qt(0.95, N - 1) * (1 / sqrt(N)) * (1 / (N - 1)) * sum((G_K_vec - mean(G_K_vec))^2), "]"))
+
+# "The 95% MRP CI is: [0, 0.0388382345703794]"
+```
+
+```{R Wait and See C}
+S <- 10000
+B <- 99
+obj_vec <- c()
+obj_first_vec <- c()
+obj_second_vec <- c()
+for (r in 1:B) {
+  # This block does calculations with the random parameter, xi
+  print(r)
+  p <- c(0.3, 0.4, 0.3)
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  xi_max <- 14
+  xi_max <- 14
+  T2 = c(5, 7.5)
+  T3 = c(0.5, 1.75)
+  PT = c(0.6, 0.4)
+  rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                  "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                  "xi3" = sample(xi3, size = S, replace = TRUE, prob = p),
+                  "alpha1" = runif(n = S, min = 0.6, max = 0.9),
+                  "alpha2" = runif(n = S, min = 0.7, max = 0.8),
+                  "alpha3" = runif(n = S, min = 0.5, max = 0.8),
+                  "alpha4" = runif(n = S, min = 0.9, max = 1),
+                  "alpha5" = rep(1, S),
+                  "T2" = sample(T2, size = S , replace = TRUE, prob = PT),
+                  "T3" = sample(T3, size = S , replace = TRUE, prob = PT)),
+                ncol = 10, byrow = F) 
+  # The parameters as given in the report
+  c <- c(10, 7, 16, 6, 0)
+  q <- c(4, 4.5, 3.2, 5.5, 10)
+  xi_max <- 14
+  c_max <- 120
+  n <- 5
+  k <- 3
+  
+  # Defining the matrices in accordance to the report
+  Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+  A <- rbind(-rep(1, n), c)
+  W <- matrix(0, nrow = n + k, ncol = n * k)
+  # Filling the first n rows
+  for (i in 1:n) {
+    begin <- (i - 1) * k + 1
+    end <- i * k
+    W[i, begin:end] <- iota(k)
+  }
+  # Filling the last k rows
+  for (j in 1:k) {
+    W[(j + n),] <- rep(-e(j, k), n)
+  }
+  b    <- c(-xi_max, c_max) 
+  h    <- c(rep(0, n), rep(-1, k))
+  
+  # Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+  m1 <- dim(A)[1]
+  m2 <- dim(W)[1]
+  n1 <- dim(A)[2]
+  n2 <- dim(W)[2]
+  
+  Z  <- zeros(m1,n*k)
+  ##########
+  
+  # Initializing the variables/matrices for the linear model. We now run a for loop#
+  # with a total of S simulations. In every iteration we calculate the optimal 
+  # solution and save these in matrices. In the end we will calculate the average
+  # costs, which should be lower than in the recourse model but higher than in 
+  # the EV model (due to our fixed T matrix)
+  
+  
+  x_matrix <- matrix(NA, nrow = S, ncol = n) # Stores the first stage solutions
+  y_matrix <- matrix(NA, nrow = S, ncol = n * k) # Stores the second stage solutions
+  obj_value_C <- vector(mode = "double", length = S) # Stores the objective value
+  obj_first_stage <- c()
+  obj_second_stage <- c()
+  for (i in 1:S) {
+    A[1, ] = -rvs[i, 4:8]
+    LSDE.A <- rbind(cbind(A, Z), cbind(-(Tech * c(rvs[i, 4:8], 1, 1, 1)), W))
+    WS_C <- list() # Recourse model
+    WS_C$A  <- LSDE.A
+    WS_C$obj <- c(c, kronecker(q, c(10, rvs[i, 9:10])))
+    WS_C$modelsense <- "min"
+    WS_C$rhs <- c(b, rep(0, n), -rvs[i, 1:3]) 
+    WS_C$sense <- rep("<=",(n+k)+length(b))
+    result_WS_C <- gurobi(WS_C, params = list(OutputFlag=0))
+    obj_value_C[i] <- result_WS_C$objval
+    obj_first_stage[i] <- sum(result_WS_C$x[1:5] * c)
+    obj_second_stage[i] <- sum(result_WS_C$x[6:20] * WS_C$obj[6:20])
+  }
+  obj_vec[r] <- mean(obj_value_C)
+  obj_first_vec[r] <- mean(obj_first_stage)
+  obj_second_vec[r] <- mean(obj_second_stage)
+}
+quants <- quantile(sort(obj_vec), c(0.025, 0.975))
+quants_fs <- quantile(sort(obj_first_vec), c(0.025, 0.975))
+quants_ss <- quantile(sort(obj_second_vec), c(0.025, 0.975))
+print(paste0("The 95% CI for the objective value is [", round(quants[1], 2), ",", round(quants[2], 2), "]"))
+print(paste0("The 95% CI for the FS objective value is [", round(quants_fs[1], 2), ",", round(quants_fs[2], 2), "]"))
+print(paste0("The 95% CI for the SS objective value is [", round(quants_ss[1], 2), ",", round(quants_ss[2], 2), "]"))
+# XXX "The 95% CI for the objective value is [391.21,394.2]"
+# "The 95% CI for the objective value is [390.97,394.64]"
+# "The 95% CI for the FS objective value is [94.71,95.6]"
+# "The 95% CI for the SS objective value is [296.18,299.13]"
+```
+
+```{R Sens Analysis budget constraint A}
+t <- 1
+increase <- c(0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4, 1.5)
+obj_vec_1 <- c()
+for (budget in increase) {
+  print(budget)
+  # This block does calculations with the random parameter, xi
+  S <- 3^3
+  p <- c(0.3, 0.4, 0.3)
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  xi_matrix <- matrix(NA, nrow = 27, ncol = 3) # Contains all different combinations that the xis can take
+  p_vec <- rep(NA, 27)
+  l <- 1
+  for (i in 1:3) {
+    for (j in 1:3) {
+      for (k in 1:3) {
+        xi_matrix[l,] <- c(xi1[i], xi2[j], xi3[k])
+        p_vec[l] <- p[i] * p[j] * p[k]
+        l <- l + 1
+      }
+    }
+  }
+  
+  # The parameters as given in the report
+  c <- c(10, 7, 16, 6)
+  q <- c(4, 4.5, 3.2, 5.5)
+  dur_mode <- c(10, 6, 1) 
+  xi_max <- 14
+  c_max <- 120 * budget
+  n <- 4
+  k <- 3
+  
+  # Defining the matrices in accordance to the report
+  Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+  A    <- rbind(-rep(1, n), c)
+  W <- matrix(0, nrow = n + k, ncol = n * k)
+  # Filling the first n rows
+  for (i in 1:n) {
+    begin <- (i - 1) * k + 1
+    end <- i * k
+    W[i, begin:end] <- iota(k)
+  }
+  # Filling the last k rows
+  for (j in 1:k) {
+    W[(j + n),] <- rep(-e(j, k), n)
+  }
+  b    <- c(-xi_max, c_max) 
+  h    <- c(rep(0, n), rep(-1, k))
+  
+  # Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+  m1 <- dim(A)[1]
+  m2 <- dim(W)[1]
+  n1 <- dim(A)[2]
+  n2 <- dim(W)[2]
+  
+  Z  <- zeros(m1, n2 * S)
+  LSDE.A <- cbind(A,Z)
+  LSDE.A <- rbind(LSDE.A, cbind(kronecker(rep(1, S),-Tech), kronecker(diag(rep(1, S)), W)))
+  
+  # Initializing the variables/matrices for the linear model
+  RM <- list() # Recourse model
+  RM$A  <- LSDE.A
+  
+  # For loop to construct the objective function
+  obj_vec <- c(c) # These are the parameters corresponding to the x's
+  for (i in 1:S) {
+    # We have n * k y variables per scenario
+    lower <- (i - 1) * n * k + length(c) + 1
+    upper <- i * n * k + length(c)
+    obj_vec[lower:upper] <- p_vec[i] * kronecker(q, dur_mode)
+  }
+  RM$obj <- obj_vec
+  RM$modelsense <- "min"
+  # Recall that the dependence on xi is in our h vector
+  rhs_vec <- c(b) # The rhs for Ax = b, realize that this constraint does not need to be repeated for each scenario
+  for (i in 1:S) { # For each scenario
+    lower <- (i - 1) * (n + k)  + length(b) + 1
+    upper <- i * (n + k) + length(b)
+    rhs_vec[lower:upper] <- c(rep(0, n), -xi_matrix[i,])# We use the ith realization of the xis as the constraint
+  }
+  
+  RM$rhs <- rhs_vec
+  RM$sense <- rep("<=",(n+k)*S+length(b))
+  
+  
+  result_recourse <- gurobi(RM, params = list(OutputFlag=0))
+  if (result_recourse$status == "INFEASIBLE") {
+    cat("No feasible solution\n")
+  }
+  print('Solution:')
+  print(result_recourse$objval)
+  print(result_recourse$x[1:n])  # Only prints first-stage solutions
+  
+  obj_vec_1[t] <- result_recourse$objval
+  if (budget == 1.3) {
+    print("For the tables:")
+    print(result_recourse$x[1:n])
+    print(obj_vec_1[t])
+    print(sum(result_recourse$x[1:n] * c))
+    print(obj_vec_1[t] - sum(result_recourse$x[1:n] * c))
+  }
+  
+  t <- t + 1
+  check <- c()
+  check[1] <- length(RM$obj) == ncol(LSDE.A) # Number of variables
+  check[2] <- length(RM$rhs) == nrow(LSDE.A) # Number of constraints
+  check[3] <- nrow(LSDE.A) == length(RM$sense)
+  if (sum(1 - check) != 0) {
+    cat("Error thrown, dimensions are not correct")
+  }
+  
+  
+  y <- result_recourse$x[(n+1):length(result_recourse$x)] # All second stage solutions
+  
+  sequencje <- seq(1, length(y), by = 3) # Takes y_11, y_21, ....
+  # Just checking if one of the second stage constraints holds
+  for (i in 1:(length(sequencje)/4)) {
+    start <- (i- 1) * 4 + 1
+    end <- i * 4
+    if ((round(sum(y[sequencje[start:end]])) < xi_matrix[i, 1]) ||
+        (round(sum(y[sequencje[(start):(end)]+1])) < xi_matrix[i, 2]) ||
+        (round(sum(y[sequencje[(start):(end)]+2])) < xi_matrix[i, 3])) {
+      print("y_{ij} is not geq than dzeta_j for some j")
+    }
+  }
+}
+print(obj_vec_1)
+plot(increase, obj_vec_1, type = 'l', xlab = "Multiplication factor budget", ylab = "Objective value")
+```
+
+```{R Sens Wait and see A}
+# This block does calculations with the random parameter, xi
+S <- 3^3
+p <- c(0.3, 0.4, 0.3)
+xi1 <- c(3, 5, 7)
+xi2 <- c(2, 3, 4)
+xi3 <- c(1, 2, 3)
+xi_matrix <- matrix(NA, nrow = 27, ncol = 3) # Contains all different combinations that the xis can take
+p_vec <- rep(NA, 27)
+l <- 1
+for (i in 1:3) {
+  for (j in 1:3) {
+    for (k in 1:3) {
+      xi_matrix[l,] <- c(xi1[i], xi2[j], xi3[k])
+      p_vec[l] <- p[i] * p[j] * p[k]
+      l <- l + 1
+    }
+  }
+}
+
+# The parameters as given in the report
+c <- c(10, 7, 16, 6)
+q <- c(4, 4.5, 3.2, 5.5)
+dur_mode <- c(10, 6, 1) 
+xi_max <- 14
+c_max <- 120
+n <- 4
+k <- 3
+
+# Defining the matrices in accordance to the report
+Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+A <- rbind(c)
+W <- matrix(0, nrow = n + k, ncol = n * k)
+# Filling the first n rows
+for (i in 1:n) {
+  begin <- (i - 1) * k + 1
+  end <- i * k
+  W[i, begin:end] <- iota(k)
+}
+# Filling the last k rows
+for (j in 1:k) {
+  W[(j + n),] <- rep(-e(j, k), n)
+}
+b    <- c(c_max) 
+h    <- c(rep(0, n), rep(-1, k))
+
+# Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+m1 <- dim(A)[1]
+m2 <- dim(W)[1]
+n1 <- dim(A)[2]
+n2 <- dim(W)[2]
+
+Z  <- zeros(m1,n*k)
+LSDE.A <- rbind(cbind(A,Z), cbind(-Tech, W))
+
+# Initializing the variables/matrices for the linear model. We now run a for loop
+# with a total of S simulations. In every iteration we calculate the optimal 
+# solution and save these in matrices. In the end we will calculate the average
+# costs, which should be lower than in the recourse model but higher than in 
+# the EV model (due to our fixed T matrix)
+
+
+x_matrix <- matrix(NA, nrow = S, ncol = n) # Stores the first stage solutions
+y_matrix <- matrix(NA, nrow = S, ncol = n * k) # Stores the second stage solutions
+obj_value <- rep(NA, S) # Stores the objective value
+
+for (s in 1:S) {
+  WS <- list() # Recourse model
+  WS$A  <- LSDE.A
+  
+  # For loop to construct the objective function
+  WS$obj <- c(c, kronecker(q, dur_mode))
+  WS$modelsense <- "min"
+  # Recall that the dependence on xi is in our h vector
+  WS$rhs <- c(b, rep(0, n), -xi_matrix[s, ]) 
+  WS$sense <- rep("<=",(n+k)+length(b))
+  
+  
+  result_WS <- gurobi(WS, params = list(OutputFlag=0))
+  if (result_WS$status == 2) {
+    cat("No feasible solution\n")
+  }
+  obj_value[s] <- result_WS$objval
+  x_matrix[s, ] <- result_WS$x[1:n]  # Only prints first-stage solutions
+  y_matrix[s, ] <- result_WS$x[5:16]
+  
+}
+check <- c()
+check[1] <- length(WS$obj) == ncol(LSDE.A) # Number of variables
+check[2] <- length(WS$rhs) == nrow(LSDE.A) # Number of constraints
+check[3] <- nrow(LSDE.A) == length(WS$sense)
+if (sum(1 - check) != 0) {
+  cat("Error thrown, dimensions are not correct")
+}
+
+cat(paste("The mean costs with the Wait-and-See method are:", mean(obj_value), "\n"))
+cat(paste("The first stage objective value is:", sum(x_matrix * c) / 27, "\n"))
+cat(paste("The second stage objective value is:", mean(obj_value) - sum(x_matrix * c) / 27, "\n"))
+
+```
+
+```{R Sens Wait and See B}
+S <- 10000
+B <- 99
+obj_vec <- c()
+obj_first_vec <- c()
+obj_second_vec <- c()
+for (r in 1:B) {
+  # This block does calculations with the random parameter, xi
+  print(r)
+  p <- c(0.3, 0.4, 0.3)
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  xi_max <- 14
+  
+  rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                  "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                  "xi3" = sample(xi3, size = S, replace = TRUE, prob = p),
+                  "alpha1" = runif(n = S, min = 0.6, max = 0.9),
+                  "alpha2" = runif(n = S, min = 0.7, max = 0.8),
+                  "alpha3" = runif(n = S, min = 0.5, max = 0.8),
+                  "alpha4" = runif(n = S, min = 0.9, max = 1),
+                  "alpha5" = rep(1, S)), ncol = 8, byrow = F) 
+  
+  
+  # The parameters as given in the report
+  c <- c(10, 7, 16, 6, 0)
+  q <- c(4, 4.5, 3.2, 5.5, 10)
+  dur_mode <- c(10, 6, 1) 
+  c_max <- 120
+  n <- 5
+  k <- 3
+  
+  # Defining the matrices in accordance to the report
+  Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+  A <- rbind(c)
+  W <- matrix(0, nrow = n + k, ncol = n * k)
+  # Filling the first n rows
+  for (i in 1:n) {
+    begin <- (i - 1) * k + 1
+    end <- i * k
+    W[i, begin:end] <- iota(k)
+  }
+  # Filling the last k rows
+  for (j in 1:k) {
+    W[(j + n),] <- rep(-e(j, k), n)
+  }
+  b    <- c(c_max) 
+  h    <- c(rep(0, n), rep(-1, k))
+  
+  # Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+  m1 <- dim(A)[1]
+  m2 <- dim(W)[1]
+  n1 <- dim(A)[2]
+  n2 <- dim(W)[2]
+  
+  Z  <- zeros(m1,n*k)
+  
+  
+  # Initializing the variables/matrices for the linear model. We now run a for loop
+  # with a total of S simulations. In every iteration we calculate the optimal 
+  # solution and save these in matrices. In the end we will calculate the average
+  # costs, which should be lower than in the recourse model but higher than in 
+  # the EV model (due to our fixed T matrix)
+  
+  
+  x_matrix <- matrix(NA, nrow = S, ncol = n) # Stores the first stage solutions
+  y_matrix <- matrix(NA, nrow = S, ncol = n * k) # Stores the second stage solutions
+  obj_value_B <- vector(mode = "double", length = S) # Stores the objective value
+  obj_first_stage <- c()
+  obj_second_stage <- c()
+  for (i in 1:S) {
+    A[1, ] = -rvs[i, 4:8]
+    LSDE.A <- rbind(cbind(A, Z), cbind(-(Tech * c(rvs[i, 4:8], 1, 1, 1)), W))
+    WS_B <- list() # Recourse model
+    WS_B$A  <- LSDE.A
+    WS_B$obj <- c(c, kronecker(q, dur_mode))
+    WS_B$modelsense <- "min"
+    WS_B$rhs <- c(b, rep(0, n), -rvs[i, 1:3]) 
+    WS_B$sense <- rep("<=",(n+k)+length(b))
+    result_WS_B <- gurobi(WS_B, params = list(OutputFlag=0))
+    obj_value_B[i] <- result_WS_B$objval
+    obj_first_stage[i] <- sum(result_WS_B$x[1:5] * c)
+    obj_second_stage[i] <- sum(result_WS_B$x[6:20] * WS_B$obj[6:20])
+  }
+  obj_vec[r] <- mean(obj_value_B)
+  obj_first_vec[r] <- mean(obj_first_stage)
+  obj_second_vec[r] <- mean(obj_second_stage)
+}
+quants <- quantile(sort(obj_vec), c(0.025, 0.975))
+quants_fs <- quantile(sort(obj_first_vec), c(0.025, 0.975))
+quants_ss <- quantile(sort(obj_second_vec), c(0.025, 0.975))
+print(paste0("The 95% CI for the objective value is [", round(quants[1], 2), ",", round(quants[2], 2), "]"))
+print(paste0("The 95% CI for the FS objective value is [", round(quants_fs[1], 2), ",", round(quants_fs[2], 2), "]"))
+print(paste0("The 95% CI for the SS objective value is [", round(quants_ss[1], 2), ",", round(quants_ss[2], 2), "]"))
+
+# "The 95% CI for the objective value is [392.17,395.36]"
+# "The 95% CI for the FS objective value is [90.93,91.72]"
+# "The 95% CI for the SS objective value is [301.11,303.86]"
+```
+
+```{R Sens Wait and See C}
+S <- 10000
+B <- 99
+obj_vec <- c()
+obj_first_vec <- c()
+obj_second_vec <- c()
+for (r in 1:B) {
+  # This block does calculations with the random parameter, xi
+  print(r)
+  p <- c(0.3, 0.4, 0.3)
+  xi1 <- c(3, 5, 7)
+  xi2 <- c(2, 3, 4)
+  xi3 <- c(1, 2, 3)
+  xi_max <- 14
+  xi_max <- 14
+  T2 = c(5, 7.5)
+  T3 = c(0.5, 1.75)
+  PT = c(0.6, 0.4)
+  rvs <- matrix(c("xi1" = sample(xi1, size = S, replace = TRUE, prob = p),
+                  "xi2" = sample(xi2, size = S, replace = TRUE, prob = p),
+                  "xi3" = sample(xi3, size = S, replace = TRUE, prob = p),
+                  "alpha1" = runif(n = S, min = 0.6, max = 0.9),
+                  "alpha2" = runif(n = S, min = 0.7, max = 0.8),
+                  "alpha3" = runif(n = S, min = 0.5, max = 0.8),
+                  "alpha4" = runif(n = S, min = 0.9, max = 1),
+                  "alpha5" = rep(1, S),
+                  "T2" = sample(T2, size = S , replace = TRUE, prob = PT),
+                  "T3" = sample(T3, size = S , replace = TRUE, prob = PT)),
+                ncol = 10, byrow = F) 
+  # The parameters as given in the report
+  c <- c(10, 7, 16, 6, 0)
+  q <- c(4, 4.5, 3.2, 5.5, 10)
+  xi_max <- 14
+  c_max <- 120
+  n <- 5
+  k <- 3
+  
+  # Defining the matrices in accordance to the report
+  Tech <- rbind(diag(1, n), kronecker(matrix(1, nrow = 1, ncol = n), rep(0, k))) # Is independent of xi for us, multiplied with x of course
+  A <- rbind(c)
+  W <- matrix(0, nrow = n + k, ncol = n * k)
+  # Filling the first n rows
+  for (i in 1:n) {
+    begin <- (i - 1) * k + 1
+    end <- i * k
+    W[i, begin:end] <- iota(k)
+  }
+  # Filling the last k rows
+  for (j in 1:k) {
+    W[(j + n),] <- rep(-e(j, k), n)
+  }
+  b    <- c(c_max) 
+  h    <- c(rep(0, n), rep(-1, k))
+  
+  # Dimension of the problem: m = "number of constraints"; n = "number of variables; 1st and 2nd stage
+  m1 <- dim(A)[1]
+  m2 <- dim(W)[1]
+  n1 <- dim(A)[2]
+  n2 <- dim(W)[2]
+  
+  Z  <- zeros(m1,n*k)
+  ##########
+  
+  # Initializing the variables/matrices for the linear model. We now run a for loop#
+  # with a total of S simulations. In every iteration we calculate the optimal 
+  # solution and save these in matrices. In the end we will calculate the average
+  # costs, which should be lower than in the recourse model but higher than in 
+  # the EV model (due to our fixed T matrix)
+  
+  
+  x_matrix <- matrix(NA, nrow = S, ncol = n) # Stores the first stage solutions
+  y_matrix <- matrix(NA, nrow = S, ncol = n * k) # Stores the second stage solutions
+  obj_value_C <- vector(mode = "double", length = S) # Stores the objective value
+  obj_first_stage <- c()
+  obj_second_stage <- c()
+  for (i in 1:S) {
+    A[1, ] = -rvs[i, 4:8]
+    LSDE.A <- rbind(cbind(A, Z), cbind(-(Tech * c(rvs[i, 4:8], 1, 1, 1)), W))
+    WS_C <- list() # Recourse model
+    WS_C$A  <- LSDE.A
+    WS_C$obj <- c(c, kronecker(q, c(10, rvs[i, 9:10])))
+    WS_C$modelsense <- "min"
+    WS_C$rhs <- c(b, rep(0, n), -rvs[i, 1:3]) 
+    WS_C$sense <- rep("<=",(n+k)+length(b))
+    result_WS_C <- gurobi(WS_C, params = list(OutputFlag=0))
+    obj_value_C[i] <- result_WS_C$objval
+    obj_first_stage[i] <- sum(result_WS_C$x[1:5] * c)
+    obj_second_stage[i] <- sum(result_WS_C$x[6:20] * WS_C$obj[6:20])
+  }
+  obj_vec[r] <- mean(obj_value_C)
+  obj_first_vec[r] <- mean(obj_first_stage)
+  obj_second_vec[r] <- mean(obj_second_stage)
+}
+quants <- quantile(sort(obj_vec), c(0.025, 0.975))
+quants_fs <- quantile(sort(obj_first_vec), c(0.025, 0.975))
+quants_ss <- quantile(sort(obj_second_vec), c(0.025, 0.975))
+print(paste0("The 95% CI for the objective value is [", round(quants[1], 2), ",", round(quants[2], 2), "]"))
+print(paste0("The 95% CI for the FS objective value is [", round(quants_fs[1], 2), ",", round(quants_fs[2], 2), "]"))
+print(paste0("The 95% CI for the SS objective value is [", round(quants_ss[1], 2), ",", round(quants_ss[2], 2), "]"))
+# XXX "The 95% CI for the objective value is [391.21,394.2]"
+# "The 95% CI for the objective value is [390.97,394.64]"
+# "The 95% CI for the FS objective value is [94.71,95.6]"
+# "The 95% CI for the SS objective value is [296.18,299.13]"
+```
