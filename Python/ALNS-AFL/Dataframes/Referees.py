@@ -7,7 +7,7 @@ Out: referee dataframe
 '''
 
 def referee_df_creator(inst):
-    referee_df = pd.read_csv(f"Datasets/Gabor/referees_Gabor_{inst}.csv")
+    referee_df = pd.read_csv(f"Datasets/referees_Gabor_{inst}.csv")
     # Remove irrelevant columns from dataframe
     referee_df = referee_df.dropna(axis = 1, how = 'all') # Removes NaN column at the end which appears due to extra delimiter
     # del referee_df["dob"]
