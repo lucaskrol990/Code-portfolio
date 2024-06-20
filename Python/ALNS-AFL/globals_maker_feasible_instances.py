@@ -14,16 +14,16 @@ feasible = False
 
 import pandas as pd
 import numpy as np
-from Dataframes.Gabor.Referees import referee_df_creator
-from Dataframes.Gabor.Match import game_df_creator
-from Dataframes.Gabor.License_requirements import license_requirement
-from Dataframes.Gabor.White_hats_needed import white_hats_needed
-from Dataframes.Gabor.Availability_matrix import availability_matrix
-from Dataframes.Gabor.Overlap_matrix import overlap_matrix
-from Dataframes.Gabor.Nu_matrix import nu_matrix
-from Dataframes.Gabor.Weekend_restriction import weekend_restriction
-from Dataframes.Gabor.Fall_back_matrix import fall_back_matrix
-from Dataframes.Gabor.NRW_list import NRW_list
+from Dataframes.Referees import referee_df_creator
+from Dataframes.Match import game_df_creator
+from Dataframes.License_requirements import license_requirement
+from Dataframes.White_hats_needed import white_hats_needed
+from Dataframes.Availability_matrix import availability_matrix
+from Dataframes.Overlap_matrix import overlap_matrix
+from Dataframes.Nu_matrix import nu_matrix
+from Dataframes.Weekend_restriction import weekend_restriction
+from Dataframes.Fall_back_matrix import fall_back_matrix
+from Dataframes.NRW_list import NRW_list
 
 
 def gs_maker(inst):
@@ -31,9 +31,9 @@ def gs_maker(inst):
       if compute_new_dfs:
             # If we wish to calculate new dataframes which can be loaded from file, you can use this structure
             # !!Note you need to indent all stuff coming after print(year) to the same tab indent then!!
-            from Dataframes.Gabor.Distance_matrix import distance_matrix_creator
-            from Dataframes.Gabor.Valid_white_hat import valid_white_hat
-            from Dataframes.Gabor.Valid_assignments import valid_assignments
+            from Dataframes.Distance_matrix import distance_matrix_creator
+            from Dataframes.Valid_white_hat import valid_white_hat
+            from Dataframes.Valid_assignments import valid_assignments
             for inst in range(1, 11):
                   print(inst)
 
@@ -74,19 +74,19 @@ def gs_maker(inst):
       if compute_new_dfs:
             distance_matrix = distance_matrix_creator(referee_df, game_df)
             gs['distance_matrix'] = distance_matrix
-            distance_matrix.to_csv(f"Datasets/Gabor/distance_matrix_{inst}.csv", index = False)
+            distance_matrix.to_csv(f"Datasets/distance_matrix_{inst}.csv", index = False)
             valid_wh = valid_white_hat(gs)
             valid_wh_df = pd.DataFrame(valid_wh)
             gs['valid_wh'] = valid_wh
-            valid_wh_df.to_csv(f"Datasets/Gabor/valid_wh_{inst}.csv", index=False)
+            valid_wh_df.to_csv(f"Datasets/valid_wh_{inst}.csv", index=False)
             valid_ass = valid_assignments(gs)
             valid_ass_df = pd.DataFrame(valid_ass)
             gs['valid_assignments'] = valid_ass
-            valid_ass_df.to_csv(f"Datasets/Gabor/valid_assignments_{inst}.csv", index=False)
+            valid_ass_df.to_csv(f"Datasets/valid_assignments_{inst}.csv", index=False)
 
 
 
-      gs['distance_matrix'] = pd.read_csv(f"Datasets/Gabor/distance_matrix_{inst}.csv")
+      gs['distance_matrix'] = pd.read_csv(f"Datasets/distance_matrix_{inst}.csv")
 
       gs['NRW_list'] = NRW_list(gs['referee_df'])
 
@@ -96,8 +96,8 @@ def gs_maker(inst):
             idx = [i for i in range(gs['nrefs'] + gs['ngames']) if i != gs['nrefs']]
             gs['max_dist'] = np.max(gs['distance_matrix'].iloc[idx, idx].values)
 
-      gs['valid_wh'] = pd.read_csv(f"Datasets/Gabor/valid_wh_{inst}.csv", index_col = False).values.tolist()
-      gs['valid_assignments'] = pd.read_csv(f"Datasets/Gabor/valid_assignments_{inst}.csv", index_col = False).values.tolist()
+      gs['valid_wh'] = pd.read_csv(f"Datasets/valid_wh_{inst}.csv", index_col = False).values.tolist()
+      gs['valid_assignments'] = pd.read_csv(f"Datasets/valid_assignments_{inst}.csv", index_col = False).values.tolist()
       gs['overlap_matrix'] = overlap_matrix(gs)
       gs['overlap_matrix_violation'] = overlap_matrix(gs, 1/3)
 
