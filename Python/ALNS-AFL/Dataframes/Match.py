@@ -5,7 +5,7 @@ In: year
 Out: game dataframe
 
 Notice: 
-1. Mistake in the csv of games, ref05 is, in error, forgotten, which means that the 12th referee has no column header
+1. Mistake in the csv of games, ref05 is, in error, forgotten, which means that the 12th referee has no column header.
 2. Some games have more than 12 referees, for now these games are skipped (with on_bad_lines = 'skip')
 '''
 def game_df_creator(inst):
