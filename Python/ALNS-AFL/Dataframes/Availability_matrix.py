@@ -9,7 +9,7 @@ Note: H added here to indicate availability from 13 onwards
 import pandas as pd
 
 def availability_matrix(gs, Feasible, inst):
-    avail_df = pd.read_csv(f"Datasets/Gabor/avails_Gabor_{inst}.csv")  # Loading in availability dataset
+    avail_df = pd.read_csv(f"Datasets/avails_Gabor_{inst}.csv")  # Loading in availability dataset
     avail_df = pd.merge(gs['referee_df'], avail_df, left_on="id", right_on="referee", how="left")
     availability_matrix = []  # Will contain when the referee is (partially) available for all referees
 
