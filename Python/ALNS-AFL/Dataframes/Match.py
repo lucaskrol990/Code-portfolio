@@ -12,7 +12,7 @@ def game_df_creator(inst):
     '''
     This version keeps the referees which are assigned
     '''
-    game_df = pd.read_csv(f"Datasets/Gabor/games_Gabor_{inst}.csv", on_bad_lines= 'skip', index_col = False)
+    game_df = pd.read_csv(f"Datasets/games_Gabor_{inst}.csv", on_bad_lines= 'skip', index_col = False)
     # Remove irrelevant columns from dataframe
     game_df = game_df.dropna(axis = 1, how = 'all') # Removes NaN column at the end which appears due to extra delimiter
 
