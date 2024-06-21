@@ -1,0 +1,375 @@
+---
+title: "AF_Instances"
+author: "Gabor Poppen"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+#Setup
+
+```{r}
+set.seed(2)
+```
+
+#Initialize
+```{r setup, include=FALSE}
+# These are the global param.
+knitr::opts_chunk$set(echo = TRUE,   # Show the code in the  file
+                      eval = TRUE)   # Execute the code
+options(digits = 3)
+```
+
+```{r include=FALSE}
+rm(list = setdiff(ls(), c("null")))
+cat("\014")
+```
+
+```{r}
+library("ggplot2")
+library("dplyr")
+library("tidyverse")
+library("chron")
+library("Matrix")
+library("lpSolve")
+library('slam')
+library("data.table")
+```
+
+```{r}
+num_offs_test = c(50, 100, 200)
+num_days_test = c(10, 20, 50, 100)
+# Avails_test stores start_i probs and end_i probs in one list
+avails_test = list(list(c(0.5, 0.1, 0.1, 0.3), c(0.1, 0.1, 0.8)), 
+                   list(c(0.3, 0.05, 0.05, 0.6), c(0.2, 0.2, 0.6)))
+games_day_range = list(c(4, 8), c(8, 16), c(2, 25))
+
+instances = list()
+i <- 0
+for (off in num_offs_test) {
+  for (days in num_days_test) {
+    for (avails in avails_test) {
+      for (games_day in games_day_range) {
+        avg_avail = avails[[1]][1] + 0.5 * (avails[[1]][2] + avails[[1]][3]) - 0.5 * avails[[1]][1] *  (avails[[2]][1] + avails[[2]][2])
+        nlocs = days * mean(games_day) + off
+        # Check if the number of officials available is likely to be higher than the officials required (use 6 instead of 4 refs         # per game in this check) and that the number of locations remains reasonable (for computational reasons)
+        if (off * avg_avail > 6 * games_day[2] &&
+            nlocs < 500) {
+          i <- i + 1
+          instances[[i]] <- list(off, days, avails, games_day)
+        }
+      }
+    }
+  }
+}
+print(length(instances))
+```
+
+
+
+```{r}
+for (inst in 3:3) {
+  #Parameters
+  
+  setup_time <- 0.5 #Time an official has to arrive before a game
+  wrap_time  <- 0.5 #Time an official has to stay after a game
+  game_time  <- 1.5 #Time of a game
+  
+  trav_speed <- 50  #Travel speed in km/h
+  max_fback  <- 20  #Parameter to adjust
+  rid_sh_cap <- 4   #Ridesharing capacity for all officials with mobility
+  max_detour <- 0.3 #Maximum detour offering ridesharing to all other officials, compared to direct route
+  
+  
+  #Generic functions
+  ###Sample function
+  sampleFrom <- function(n, y) {
+    if (length(y) == 1L & n != 0) {
+      sf <- y
+    } else {
+      sf <- sample(y, size = n)
+    }
+    sf
+  }
+
+
+  ###Euclidean Distance Creators
+
+  EDM_creator1a <- function(dist_matr, loca){
+    x.cord <- loca$geoLat
+    y.cord <- loca$geoLng
+    EDM <- NULL
+    for (i in 1:nrow(dist_matr)){
+    x.cord1 <- dist_matr$geoLat[i]
+    y.cord1 <- dist_matr$geoLng[i]
+     EDM <- rbind(EDM, (sqrt((x.cord - x.cord1)^2 + (y.cord - y.cord1)^2)))
+    }
+    EDM
+  }
+
+  EDM_creator1 <- function(dist_matr, loca){
+    R    <- 6371
+    phi1 <- loca$geoLat * (pi / 180)
+    EDM  <- NULL
+
+    for (i in 1:nrow(dist_matr)){
+      phi2         <- dist_matr$geoLat[i] * (pi / 180)
+      delta_phi    <- (dist_matr$geoLat[i] - loca$geoLat) * (pi / 180)
+      delta_lambda <- (dist_matr$geoLng[i] - loca$geoLng) * (pi / 180)
+
+      a <- sin(delta_phi / 2)^2 + cos(phi1) * cos(phi2) * sin(delta_lambda / 2)^2
+      c <- 2 * atan2(sqrt(a), sqrt(1 - a))
+      d <- R * c
+
+      EDM <- rbind(EDM, d)
+    }
+    row.names(EDM) <- NULL
+    EDM
+  }
+
+  EDM_creator2 <- function(dist_matr){
+    R      <- 6371
+    phi    <- dist_matr$geoLat * (pi / 180)
+    lambda <- dist_matr$geoLng * (pi / 180)
+    EDM <- NULL
+    for (i in 1:nrow(dist_matr)){
+      delta_phi    <- phi[i] - phi
+      delta_lambda <- lambda[i] - lambda
+
+      a   <- sin(delta_phi / 2)^2 + cos(phi[i]) * cos(phi) * sin(delta_lambda / 2)^2
+      c   <- 2 * atan2(sqrt(a), sqrt(1 - a))
+      d   <- R * c
+      EDM <- rbind(EDM, d)
+    }
+    row.names(EDM) <- NULL
+    EDM
+  }
+
+  EDM_creator3 <- function(loca1, loca2) {
+    R <- 6371  # Earth's radius in kilometers
+    phi1 <- loca1$geoLat * (pi / 180)  # Convert degrees to radians
+    phi2 <- loca2$geoLat * (pi / 180)
+    delta_phi    <- (loca2$geoLat - loca1$geoLat) * (pi / 180)
+    delta_lambda <- (loca2$geoLng - loca1$geoLng) * (pi / 180)
+
+    # Haversine formula
+    a <- sin(delta_phi / 2)^2 + cos(phi1) * cos(phi2) * sin(delta_lambda / 2)^2
+    c <- 2 * atan2(sqrt(a), sqrt(1 - a))
+
+    d <- R * c  # Distance in kilometers
+    d
+  }
+
+
+  ###Games
+
+  num_days      <- instances[[inst]][[2]]
+  num_games     <- sample(instances[[inst]][[4]][1]:instances[[inst]][[4]][2], num_days, replace = TRUE)
+  num_leags     <- 5
+  num_cl_le     <- 20
+  num_clubs     <- num_leags * num_cl_le
+  num_venue     <- max(num_leags * 2, num_cl_le)
+
+
+
+  team_inf_i <- data.frame(
+    team_id = 1:num_clubs,
+    league_id = rep(1:num_leags, each = num_cl_le)
+  )
+
+  sample_venues <- function(n, num_venues) {
+    venues <- sample(num_venues, n, replace = FALSE)
+    return(venues)
+  }
+
+  team_inf_i$venue_id <- unlist(tapply(team_inf_i$league_id, team_inf_i$league_id, function(x) sample_venues(length(x), num_venue)))
+
+  generate_geo <- function(min, max, size) {
+    return(rbeta(size, 2, 2) * (max - min) + min)
+  }
+
+  unique_venues <- unique(team_inf_i$venue_id)
+  venue_coords <- data.frame(
+    venue_id = unique_venues,
+    geoLat = generate_geo(47.5, 52.5, length(unique_venues)),
+    geoLng = generate_geo(6, 12, length(unique_venues))
+  )
+
+  team_inf_i <- merge(team_inf_i, venue_coords, by = "venue_id")
+
+
+
+  league_inf_i          <- data.frame(league_id = 1:num_leags)
+  league_inf_i$num_offs <- 4
+  league_inf_i$toplev1  <- ifelse(league_inf_i$league_id == 1, 1, 0)
+  league_inf_i$toplev2  <- ifelse(league_inf_i$league_id == 2, 1, 0)
+  league_inf_i$cupmode  <- 0
+  league_inf_i$whprosp  <- ifelse(league_inf_i$league_id %in% (num_leags-1):num_leags, 1, 0)
+  league_inf_i$offownc  <- ifelse(league_inf_i$league_id == num_leags, 1, 0)
+  league_inf_i$lirest   <- ifelse(league_inf_i$league_id %in% (num_leags-1):num_leags, 2,
+                                ifelse(league_inf_i$league_id == (num_leags-2), 1, 0))
+  league_inf_i$nwh      <- 1
+
+
+
+
+  game_list       <- vector("list", num_days)
+  game_id_counter <- 1
+
+  for (day in 1:num_days) {
+    games_today     <- num_games[day]
+    available_teams <- team_inf_i$team_id
+    team1_ids       <- numeric(games_today)
+    team2_ids       <- numeric(games_today)
+    used_teams      <- integer(0)
+
+    for (game in 1:games_today) {
+      valid_team1s    <- setdiff(available_teams, used_teams)
+      team1_ids[game] <- sample(valid_team1s, 1)
+      used_teams      <- c(used_teams, team1_ids[game])
+
+      league_teams    <- team_inf_i$team_id[team_inf_i$league_id == team_inf_i$league_id[team_inf_i$team_id == team1_ids[game]]]
+      valid_team2s    <- setdiff(league_teams, c(used_teams, team1_ids[game]))
+      team2_ids[game] <- sample(valid_team2s, 1)
+      used_teams      <- c(used_teams, team2_ids[game])
+    }
+
+    venues  <- team_inf_i$venue_id[match(team1_ids, team_inf_i$team_id)]
+    leagues <- team_inf_i$league_id[match(team1_ids, team_inf_i$team_id)]
+    times   <- sample(c(9, 11, 13, 15, 17), games_today, replace = TRUE, prob = c(0.2, 0.2, 0.2, 0.2, 0.2))
+
+    games_df <- data.frame(
+    #  id = game_id_counter:(game_id_counter + games_today - 1),
+      day = rep(day, games_today),
+      team1 = team1_ids,
+      team2 = team2_ids,
+      venue = venues,
+      time = times,
+      league = leagues,
+      geoLat = team_inf_i$geoLat[match(team1_ids, team_inf_i$team_id)],
+      geoLng = team_inf_i$geoLng[match(team1_ids, team_inf_i$team_id)],
+      club1 = team1_ids,
+      club2 = rep(-1, games_today),
+      club3 = team2_ids,
+      club4 = rep(-1, games_today)
+    )
+
+    games_df         <- merge(games_df, league_inf_i, by.x = "league", by.y = "league_id")
+    game_list[[day]] <- games_df
+    game_id_counter  <- game_id_counter + games_today
+  }
+
+  game_info_i <- do.call(rbind, game_list)
+  game_info_i$id <- c(1:nrow(game_info_i))
+  print(game_info_i)
+  write.csv(game_info_i, sprintf("games_Gabor_%d.csv", inst + 1), row.names = FALSE)
+
+
+  ###Officials
+
+  num_officials <- instances[[inst]][[1]]
+  referee_ids   <- 1:num_officials
+
+  referee_ids <- 1:num_officials
+  associations <- rep(1, num_officials)
+  licenses    <- sample(c("A", "B", "C", "D", "E"), num_officials, replace = TRUE, prob = c(0.2, 0.3, 0.25, 0.15, 0.1))
+  reqgames    <- ifelse(licenses %in% c("A", "B", "C", "D"), 0, 0)
+  maxgames    <- rep(100, num_officials)
+  clubs       <- sample(1:num_clubs, num_officials, replace = TRUE)
+
+  official_inf_i <- data.frame(
+    id = referee_ids,
+    association = associations,
+    license = licenses,
+    reqgames = reqgames,
+    maxgames = maxgames,
+    club = clubs
+  )
+
+  official_inf_i$HSR  <- ifelse(official_inf_i$license == "A", 1,
+                               ifelse(official_inf_i$license == "B", rbinom(n = length(official_inf_i$license), size = 1, prob = 0.5), 0))
+
+  official_inf_i$HSRP <- ifelse(official_inf_i$HSR == 1, 0,
+                                ifelse(official_inf_i$license == "B", rbinom(n = length(official_inf_i$license), size = 1, prob = 0.5),
+                                       ifelse(official_inf_i$license == "C", rbinom(n = length(official_inf_i$license), size = 1, prob = 0.25), 0)))
+
+  official_inf_i$GFL  <- ifelse(official_inf_i$license %in% c("A", "B"), 1, 0)
+  official_inf_i$GFL2 <- ifelse(official_inf_i$license %in% c("A", "B", "C"), 1, 0)
+
+  mean_geoLat <- 50
+  sd_geoLat <- 50 / 9
+  official_inf_i$geoLat <- generate_geo(47.5, 52.5, nrow(official_inf_i))
+
+  mean_geoLng <- 9
+  sd_geoLng <- 9/50
+  official_inf_i$geoLng <- generate_geo(6, 12, nrow(official_inf_i))
+
+  official_inf_i$licind   <- ifelse(official_inf_i$license == "E", 1, 0)
+
+  official_inf_i$mobility <- official_inf_i$mobility <- sample(c('true', 'false'), size = nrow(official_inf_i), replace = TRUE, prob = c(0.95, 0.05))
+  print(official_inf_i)
+  write.csv(official_inf_i, sprintf("referees_Gabor_%d.csv", inst + 1), row.names = FALSE)
+
+
+  ###Availability
+
+  values <- c(0, 13, 16, 24)
+  probabilities <- instances[[inst]][[3]][[1]]
+
+  avail_start_i <- matrix(sample(values, num_officials * num_days, replace = TRUE, prob = probabilities),
+                 nrow = num_officials,
+                 ncol = num_days)
+
+  avail_start_i           <- as.data.frame(avail_start_i)
+  colnames(avail_start_i) <- c(1:num_days)
+  avail_start_i           <- cbind(referee = referee_ids, avail_start_i)
+
+  # Print the dataframe
+  print(avail_start_i)
+
+
+
+  avail_end_i <- avail_start_i
+
+  for (i in 1:nrow(avail_end_i)) {
+    for (j in 2:ncol(avail_end_i)) {
+      if (avail_start_i[i, j] == 0) {
+        avail_end_i[i, j] <- sample(c(13, 16, 24), 1, prob = instances[[inst]][[3]][[2]])
+      } else if (avail_start_i[i, j] %in% c(13, 16)) {
+        avail_end_i[i, j] <- 24
+      } else if (avail_start_i[i, j] == 24) {
+        avail_end_i[i, j] <- 0
+      }
+    }
+  }
+
+  ref_avail_vec = c()
+  for (ref in 1:num_officials) {
+    ref_avail = c()
+    for (day in 1:num_days) {
+      if (avail_start_i[ref, day + 1] == 0 && avail_end_i[ref, day + 1] == 24) {
+        ref_avail = append(ref_avail, 'J')
+      } else if (avail_start_i[ref, day + 1] == 0 && avail_end_i[ref, day + 1] == 13) {
+        ref_avail = append(ref_avail, 'M')
+      } else if (avail_start_i[ref, day + 1] == 13 && avail_end_i[ref, day + 1] == 16) {
+        ref_avail = append(ref_avail, 'A')
+      } else if (avail_start_i[ref, day + 1] == 16 && avail_end_i[ref, day + 1] == 24) {
+        ref_avail = append(ref_avail, 'B')
+      } else if (avail_start_i[ref, day + 1] == 0 && avail_end_i[ref, day + 1] == 16) {
+        ref_avail = append(ref_avail, 'D')
+      } else if (avail_start_i[ref, day + 1] == 13 && avail_end_i[ref, day + 1] == 24) {
+        ref_avail = append(ref_avail, 'H')
+      } else {
+        ref_avail = append(ref_avail, 'N')
+      }
+    }
+    ref_avail_vec = append(ref_avail_vec, paste0(ref_avail, collapse = ""))
+  }
+
+  # avail_matrix <- matrix(ref_avail_vec, nrow = num_officials, ncol = num_days, byrow = TRUE)
+  # Convert the matrix into a data frame
+  avail_df <- data.frame(referee = 1:num_officials,
+                            avail = ref_avail_vec)
+  print(avail_df)
+  write.csv(avail_df, sprintf("avails_Gabor_%d.csv", inst + 1), row.names = FALSE)
+}
+```
